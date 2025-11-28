@@ -11,7 +11,6 @@ Notable features:
 - Group-Query Attention (GQA) support for more efficient inference
 """
 
-import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -22,7 +21,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.gpt import CausalSelfAttention, MLP, Block, GPT
+from nanochat.gpt import Block, GPT
 
 @dataclass
 class GPTConfig:
@@ -51,11 +50,10 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class LayeredGPT(GPT):
-    def __init__(self, config, num_iterations, reverse_train_order: bool = False):
+    def __init__(self, config, freeze_every: int, reverse_train_order: bool = False):
         super().__init__(config)
         # freeze weights of the current training layer every freeze_every layers
-        self.freeze_every = num_iterations // config.n_layer
-        self.total_iterations = num_iterations
+        self.freeze_every = freeze_every
         self.reverse_train_order = reverse_train_order
         self.prev_gate_level = 0 if not reverse_train_order else config.n_layer - 1
 
@@ -114,15 +112,15 @@ class LayeredGPT(GPT):
         return optimizers
 
     def check_gate_level(self, gate_level):
-        if gate_level != self.prev_gate_level:
+        if gate_level != self.prev_gate_level and self.training and abs(gate_level - self.prev_gate_level) == 1:
             layer = self.transformer.h[self.prev_gate_level]
             # copy over the weights from the previous layer to the current layer
             print0("Copying weights from previous layer to current layer")
             for param, prev_param in zip(self.transformer.h[gate_level].parameters(), layer.parameters()):
                 param.data.copy_(prev_param.data)
 
-            for param in layer.parameters():
-                param.requires_grad = False
+            # for param in layer.parameters():
+            #     param.requires_grad = False
             self.prev_gate_level = gate_level
             print0(f"New gate level: {gate_level}")
         return gate_level
@@ -142,7 +140,7 @@ class LayeredGPT(GPT):
         x = self.transformer.wte(idx)
         x = norm(x)
         gate_level = step // self.freeze_every if step is not None else 0
-        if self.reverse_train_order:
+        if self.reverse_train_order and gate_level is not None:
             gate_level = max(len(self.transformer.h) - gate_level - 1, 0)
 
         self.check_gate_level(gate_level)

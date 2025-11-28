@@ -23,6 +23,6 @@ fi
 # wait $DATASET_DOWNLOAD_PID
 
 # pretrain the d20 model
-uv run python -m scripts.base_train --run=base --depth=10 --device_batch_size=8 --num_iterations=5075
+# uv run python -m scripts.base_train --run=base --depth=10 --device_batch_size=8 --num_iterations=5075
 uv run python -m scripts.base_layered_train --run=reversed-layerwise --reverse-train-order=1
 uv run python -m scripts.base_layered_train --run=layerwise

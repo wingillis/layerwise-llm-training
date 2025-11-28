@@ -27,6 +27,7 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
+from nanochat.utils import lr_multiplier_factory, get_muon_momentum 
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 from dotenv import load_dotenv
@@ -144,14 +145,7 @@ max_seq_len = settings.max_seq_len
 num_iterations = settings.num_iterations
 device_batch_size = settings.device_batch_size
 total_batch_size = settings.total_batch_size
-embedding_lr = settings.embedding_lr
-unembedding_lr = settings.unembedding_lr
-weight_decay = settings.weight_decay
-matrix_lr = settings.matrix_lr
 grad_clip = settings.grad_clip
-warmup_ratio = settings.warmup_ratio
-warmdown_ratio = settings.warmdown_ratio
-final_lr_frac = settings.final_lr_frac
 resume_from_step = settings.resume_from_step
 eval_every = settings.eval_every
 eval_tokens = settings.eval_tokens
@@ -206,9 +200,11 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+
+freeze_every = settings.num_iterations // settings.depth
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = LayeredGPT(model_config, num_iterations=num_iterations, reverse_train_order=settings.reverse_train_order)
+    model = LayeredGPT(model_config, freeze_every=freeze_every, reverse_train_order=settings.reverse_train_order)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -252,7 +248,7 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+optimizers = model.setup_optimizers(unembedding_lr=settings.unembedding_lr, embedding_lr=settings.embedding_lr, matrix_lr=settings.matrix_lr, weight_decay=settings.weight_decay)
 adamw_optimizer, muon_optimizer = optimizers
 
 if resuming:
@@ -270,25 +266,7 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
-
-# Learning rate scheduler
-def get_lr_multiplier(it):
-    warmup_iters = round(warmup_ratio * num_iterations)
-    warmdown_iters = round(warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * final_lr_frac
-
-# Momentum scheduler for Muon optimizer
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
-
+get_lr_multiplier = lr_multiplier_factory(warmup_ratio=settings.warmup_ratio, warmdown_ratio=settings.warmdown_ratio, num_iterations=num_iterations, final_lr_frac=settings.final_lr_frac)
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
@@ -316,7 +294,7 @@ while True:
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, step)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -449,6 +427,7 @@ while True:
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
+            "train/gate_level": step // freeze_every,
         }
         if grad_clip_enabled:
             log_data["train/grad_norm"] = grad_norm
@@ -473,9 +452,9 @@ get_report().log(section="Base model training", data=[
         "Number of training tokens": total_tokens,
         "Tokens : Params ratio": total_batch_size * num_iterations / num_params,
         "DDP world size": ddp_world_size,
-        "warmup_ratio": warmup_ratio,
-        "warmdown_ratio": warmdown_ratio,
-        "final_lr_frac": final_lr_frac,
+        "warmup_ratio": settings.warmup_ratio,
+        "warmdown_ratio": settings.warmdown_ratio,
+        "final_lr_frac": settings.final_lr_frac,
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
