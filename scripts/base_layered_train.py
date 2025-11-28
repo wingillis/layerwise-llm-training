@@ -21,7 +21,7 @@ import wandb
 import torch
 
 from typing import Any
-from nanochat.layered_gpt import GPT, GPTConfig
+from nanochat.layered_gpt import LayeredGPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -97,6 +97,8 @@ class TrainSettings(BaseSettings):
     # optionally override the model tag for the output checkpoint directory name
     model_tag: str = ""
 
+    reverse_train_order: bool = False
+
     model_config = SettingsConfigDict(env_prefix="TRAIN_")
 
     @classmethod
@@ -132,6 +134,7 @@ if len(sys.argv) > 1:
         k, v = item.split("=")
         k = k.replace("--", "").replace("-", "_")
         updated_params[k] = v
+        print(f"Setting {k} to {v}")
 
 settings = TrainSettings.load_or_create().model_copy(update=updated_params)
 
@@ -205,7 +208,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model = LayeredGPT(model_config, num_iterations=num_iterations, reverse_train_order=settings.reverse_train_order)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -221,7 +224,7 @@ if resuming:
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
@@ -289,12 +292,12 @@ def get_muon_momentum(it):
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
 
-if not resuming:
-    step = 0
-    min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
-else:
+step = 0
+min_val_bpb = float("inf")
+smooth_train_loss = 0 # EMA of training loss
+total_training_time = 0 # total wall-clock time of training
+
+if resuming:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
     min_val_bpb = loop_state["min_val_bpb"]
@@ -397,7 +400,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, step=step)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -436,7 +439,7 @@ while True:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
+    if step % 10 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
