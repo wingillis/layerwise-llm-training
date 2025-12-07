@@ -16,6 +16,7 @@ from pathlib import Path
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
+import gc
 
 import wandb
 import torch
@@ -28,10 +29,12 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, p
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
-from nanochat.utils import lr_multiplier_factory, get_muon_momentum 
+from nanochat.utils import lr_multiplier_factory, get_muon_momentum, find_optimal_batch_size 
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
 from dotenv import load_dotenv
+
+# -----------------------------------------------------------------------------
 
 load_dotenv(override=True)
 print_banner()
