@@ -49,7 +49,7 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 
-class LayeredGPT(GPT):
+class WeightApproxGPT(GPT):
     def __init__(self, config, freeze_every: int, reverse_train_order: bool = False):
         super().__init__(config)
         # freeze weights of the current training layer every freeze_every layers

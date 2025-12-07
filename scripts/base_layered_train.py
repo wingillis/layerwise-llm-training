@@ -23,7 +23,7 @@ import torch
 
 from typing import Any
 from tqdm import tqdm
-from nanochat.layered_gpt import LayeredGPT, GPTConfig
+from nanochat.approximated_gpt import WeightApproxGPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -208,7 +208,7 @@ model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_la
 freeze_every = settings.num_iterations // settings.depth
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = LayeredGPT(model_config, freeze_every=freeze_every, reverse_train_order=settings.reverse_train_order)
+    model = WeightApproxGPT(model_config, freeze_every=freeze_every, reverse_train_order=settings.reverse_train_order)
 model.to_empty(device=device)
 model.init_weights()
 

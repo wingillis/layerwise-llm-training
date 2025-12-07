@@ -9,7 +9,7 @@ from functools import wraps
 from pathlib import Path
 
 import torch
-from nanochat.layered_gpt import LayeredGPT
+from nanochat.approximated_gpt import WeightApproxGPT
 from nanochat.common import print0, get_base_dir
 
 
@@ -105,7 +105,7 @@ def _test_batch_size_fit(
 
         # Create model (same pattern as main training)
         with torch.device("meta"):
-            test_model = LayeredGPT(config, freeze_every=freeze_every,
+            test_model = WeightApproxGPT(config, freeze_every=freeze_every,
                                    reverse_train_order=reverse_train_order)
         test_model.to_empty(device=device)
         test_model.init_weights()
