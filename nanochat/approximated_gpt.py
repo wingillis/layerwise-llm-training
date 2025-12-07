@@ -13,6 +13,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -49,6 +50,138 @@ def apply_rotary_emb(x, cos, sin):
     return out
 
 
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+    def forward(self, x, cos_sin, kv_cache):
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
+        q, k = norm(q), norm(k) # QK norm
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+
+        # Apply KV cache: insert current k,v into cache, get the full view so far
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2) # number of queries in this forward pass
+        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+
+        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
+        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
+        if kv_cache is None or Tq == Tk:
+            # During training (no KV cache), attend as usual with causal attention
+            # And even if there is KV cache, we can still use this simple version when Tq == Tk
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        elif Tq == 1:
+            # During inference but with a single query in this forward pass:
+            # The query has to attend to all the keys/values in the cache
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        else:
+            # During inference AND we have a chunk of queries in this forward pass:
+            # First, each query attends to all the cached keys/values (i.e. full prefix)
+            attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
+            prefix_len = Tk - Tq
+            if prefix_len > 0: # can't be negative but could be zero
+                attn_mask[:, :prefix_len] = True
+            # Then, causal attention within this chunk
+            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Re-assemble the heads side by side and project back to residual stream
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+class ApproxLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, approx_type: Literal["svd", "abba"] = "svd", rank: int = 16, bias: bool = False):
+        super().__init__()
+        if approx_type == "svd":
+            self.linear = ApproxLinearSVD(in_features, out_features, rank, bias)
+        elif approx_type == "abba":
+            self.linear = ApproxLinearABBA(in_features, out_features, rank, bias)
+        else:
+            raise ValueError(f"Unknown approximation type: {approx_type}")
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class ApproxLinearSVD(nn.Module):
+    def __init__(self, in_features, out_features, rank: int = 16, bias: bool = False):
+        super().__init__()
+        self.rank = rank
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else 0
+        self.U = nn.Parameter(torch.zeros(out_features, rank))
+        self.V = nn.Parameter(torch.zeros(in_features, rank))
+
+    def forward(self, x):
+        W = self.V @ self.U.T
+        return torch.einsum('bi,ij->bj', x, W) + self.bias 
+
+
+class ApproxLinearABBA(nn.Module):
+    def __init__(self, in_features, out_features, rank: int = 16, bias: bool = False):
+        super().__init__()
+        self.rank = rank // 2
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else 0
+        self.A1 = nn.Parameter(torch.zeros(in_features, self.rank))
+        self.B1 = nn.Parameter(torch.zeros(out_features, self.rank))
+        self.A2 = nn.Parameter(torch.zeros(in_features, self.rank))
+        self.B2 = nn.Parameter(torch.zeros(out_features, self.rank))
+
+    def forward(self, x):
+        W1 = self.A1 @ self.B1.T
+        W2 = self.A2 @ self.B2.T
+        W = W2 * W1
+        return torch.einsum('bi,ij->bj', x, W) + self.bias 
+
+
+class ApproxWeightMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = ApproxLinear(config.n_embd, 4 * config.n_embd, config.mlp_proj_rank, bias=False)
+        self.c_proj = ApproxLinear(4 * config.n_embd, config.n_embd, config.mlp_proj_rank, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
+
+class ApproxWeightBlock(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = ApproxWeightMLP(config)
+
+    def forward(self, x, cos_sin, kv_cache):
+        x = x + self.attn(norm(x), cos_sin, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x
+
 class WeightApproxGPT(GPT):
     def __init__(self, config, freeze_every: int, reverse_train_order: bool = False):
         super().__init__(config)
@@ -56,6 +189,11 @@ class WeightApproxGPT(GPT):
         self.freeze_every = freeze_every
         self.reverse_train_order = reverse_train_order
         self.prev_gate_level = 0 if not reverse_train_order else config.n_layer - 1
+
+    def add_block(self, layer_idx):
+        block = ApproxWeightBlock(self.config, layer_idx)
+        self.transformer.h.append(block)
+        self.config.n_layer += 1
 
     def init_weights(self):
         self.apply(self._init_weights)
