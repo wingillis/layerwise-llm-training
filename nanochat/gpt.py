@@ -140,10 +140,10 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
+            "wte": torch.compile(nn.Embedding(config.vocab_size, config.n_embd), dynamic=False),
             "h": nn.ModuleList([torch.compile(Block(config, layer_idx), dynamic=False) for layer_idx in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = torch.compile(nn.Linear(config.n_embd, config.vocab_size, bias=False), dynamic=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.

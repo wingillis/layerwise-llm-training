@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -e
+
 source .env
 
 export OMP_NUM_THREADS=1

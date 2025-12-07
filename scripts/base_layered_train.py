@@ -21,6 +21,7 @@ import wandb
 import torch
 
 from typing import Any
+from tqdm import tqdm
 from nanochat.layered_gpt import LayeredGPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
@@ -284,7 +285,8 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # Training loop
-while True:
+pbar = tqdm(range(num_iterations), desc="training")
+for mstep in pbar:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -413,10 +415,13 @@ while True:
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
-    if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    if step > 2:
+        total_training_time += dt # only count the time after the first few steps
+    pf = { "loss": debiased_smooth_loss, "tok_per_sec": round(tok_per_sec), }
+    if grad_clip_enabled:
+        pf["grad_norm"] = round(grad_norm, 2)
+    pbar.set_postfix(pf)
+
     if step % 10 == 0:
         log_data = {
             "step": step,
