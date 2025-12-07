@@ -340,6 +340,9 @@ class WeightApproxGPT(GPT):
         # freeze weights of the current training layer every freeze_every layers
         self.freeze_every = freeze_every
         self.prev_gate_level = 0
+        # Store optimizer references (set by setup_optimizers)
+        self.adamw_optimizer = None
+        self.muon_optimizer = None
 
     def add_block(self, layer_idx):
         block = ApproxWeightBlock(self.config, layer_idx)
@@ -409,7 +412,69 @@ class WeightApproxGPT(GPT):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
+        # Store optimizer references
+        self.adamw_optimizer = adamw_optimizer
+        self.muon_optimizer = muon_optimizer
         return optimizers
+
+    def _add_block_to_optimizer(self, block):
+        """Add new block's parameters to the Muon optimizer.
+
+        Handles both Muon (groups by numel) and DistMuon (groups by shape).
+        """
+        if self.muon_optimizer is None:
+            return  # Optimizers not set up yet
+
+        ddp, rank, local_rank, world_size = get_dist_info()
+        is_dist_muon = ddp
+
+        # Get all parameters from the new block
+        new_params = list(block.parameters())
+
+        # Group parameters by shape (DistMuon) or numel (Muon)
+        def key_fn(p):
+            return p.shape if is_dist_muon else p.numel()
+
+        new_params_by_key = {}
+        for p in new_params:
+            key = key_fn(p)
+            if key not in new_params_by_key:
+                new_params_by_key[key] = []
+            new_params_by_key[key].append(p)
+
+        # Add to existing param_group or create new one
+        for key, params in new_params_by_key.items():
+            added_to_existing = False
+
+            # Try to find existing group with matching key
+            for group in self.muon_optimizer.param_groups:
+                if len(group["params"]) == 0:
+                    continue
+
+                existing_param = group["params"][0]
+                group_key = key_fn(existing_param)
+
+                if group_key == key:
+                    # Add to existing group
+                    group["params"].extend(params)
+                    added_to_existing = True
+                    if rank == 0:
+                        print0(
+                            f"Added {len(params)} params to existing Muon group (key={key})"
+                        )
+                    break
+
+            # Create new group if no match found
+            if not added_to_existing:
+                new_group = {"params": params}
+                if is_dist_muon and len(params) > 0:
+                    new_group["zero_buffer"] = torch.zeros_like(params[0])
+
+                self.muon_optimizer.add_param_group(new_group)
+                if rank == 0:
+                    print0(
+                        f"Created new Muon param group with {len(params)} params (key={key})"
+                    )
 
     def check_gate_level(self, gate_level):
         # New implementation: only support forward direction by adding blocks
@@ -427,14 +492,20 @@ class WeightApproxGPT(GPT):
             print0(f"New gate level: {gate_level}")
 
             if self.config.freeze_previous_weights:
-                # pyrefly: ignore
-                for param in self.transformer.h[layer_idx].parameters():
-                    param.requires_grad = False
+                # Freeze all PREVIOUS blocks (not the newly added one)
+                for i in range(layer_idx):
+                    for param in self.transformer.h[i].parameters():  # pyrefly: ignore
+                        param.requires_grad = False
 
-                if self.prev_gate_level == 0:
-                    # also freeze the embedding weights
+                # Also freeze embeddings on first block addition
+                if layer_idx == 1:  # Just added second block
                     for param in self.transformer.wte.parameters():  # pyrefly: ignore
                         param.requires_grad = False
+
+            # Register the NEW block's parameters with optimizer
+            # (always do this since the new block is trainable)
+            new_block = self.transformer.h[layer_idx]  # pyrefly: ignore
+            self._add_block_to_optimizer(new_block)
 
         return gate_level
 
@@ -468,13 +539,10 @@ class WeightApproxGPT(GPT):
 
         self.check_gate_level(gate_level)
 
-        for i, block in enumerate(self.transformer.h):
+        for i, block in enumerate(self.transformer.h):  # pyrefly: ignore
             # Only support forward direction - process blocks up to gate_level
             if i > gate_level:
                 break
-            # Remove reverse training order logic
-            # if self.reverse_train_order and i < gate_level:
-            #     continue
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
@@ -482,7 +550,6 @@ class WeightApproxGPT(GPT):
         softcap = 15
         if targets is not None:
             # training mode: compute and return the loss
-            # TODO: experiment with Liger Kernels / chunked cross-entropy etc.
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
             logits = logits.float()  # use tf32/fp32 for logits
