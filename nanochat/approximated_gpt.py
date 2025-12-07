@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.gpt import Block, GPT
+from nanochat.gpt import GPT
 
 
 @dataclass
@@ -34,6 +34,19 @@ class GPTConfig:
     n_head: int = 6  # number of query heads
     n_kv_head: int = 6  # number of key/value heads (GQA)
     n_embd: int = 768
+    # Low-rank approximation settings
+    approx_type: Literal["svd", "abba"] = (
+        "svd"  # Type of linear approximation: "svd" or "abba"
+    )
+    mlp_proj_rank: int = 16  # Rank for low-rank MLP weights approximation
+    # Layer-wise training settings
+    build_by_layer: bool = True  # Whether to build model layer-by-layer incrementally
+    copy_block_weights: bool = (
+        True  # Whether new blocks copy weights from previous layer
+    )
+    freeze_previous_weights: bool = (
+        False  # Whether to freeze previous blocks during training
+    )
 
 
 def norm(x):
@@ -92,9 +105,8 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.insert_kv(self.layer_idx, k, v)
         Tq = q.size(2)  # number of queries in this forward pass
-        Tk = k.size(
-            2
-        )  # number of keys/values in total (in the cache + current forward pass)
+        # number of keys/values in total (in the cache + current forward pass)
+        Tk = k.size(2)
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = (
@@ -276,7 +288,7 @@ class ApproxWeightBlock(nn.Module):
 
 
 class WeightApproxGPT(GPT):
-    def __init__(self, config, freeze_every: int, reverse_train_order: bool = False):
+    def __init__(self, config, freeze_every: int):
         nn.Module.__init__(self)
         self.config = config
         if config.build_by_layer:
@@ -327,15 +339,16 @@ class WeightApproxGPT(GPT):
         self.register_buffer("sin", sin, persistent=False)
         # freeze weights of the current training layer every freeze_every layers
         self.freeze_every = freeze_every
-        self.reverse_train_order = reverse_train_order
-        self.prev_gate_level = 0 if not reverse_train_order else config.n_layer - 1
+        self.prev_gate_level = 0
 
     def add_block(self, layer_idx):
         block = ApproxWeightBlock(self.config, layer_idx)
         if self.config.copy_block_weights:
-            block.load_state_dict(self.transformer.h[layer_idx - 1].state_dict())  # pyrefly: ignore
+            block.load_state_dict(
+                self.transformer.h[layer_idx - 1].state_dict()
+            )  # pyrefly: ignore
         # pyrefly: ignore
-        self.transformer.h.append(block)
+        self.transformer.h.append(torch.compile(block, dynamic=False))
         self.config.n_layer += 1
 
     def init_weights(self):
@@ -399,23 +412,30 @@ class WeightApproxGPT(GPT):
         return optimizers
 
     def check_gate_level(self, gate_level):
+        # New implementation: only support forward direction by adding blocks
         if (
             gate_level != self.prev_gate_level
             and self.training
-            and abs(gate_level - self.prev_gate_level) == 1
+            and gate_level > self.prev_gate_level  # Only forward direction
         ):
-            layer = self.transformer.h[self.prev_gate_level]
-            # copy over the weights from the previous layer to the current layer
-            print0("Copying weights from previous layer to current layer")
-            for param, prev_param in zip(
-                self.transformer.h[gate_level].parameters(), layer.parameters()
-            ):
-                param.data.copy_(prev_param.data)
+            # Add blocks for each new gate level needed
+            layer_idx = len(self.transformer.h)  # pyrefly: ignore
+            self.add_block(layer_idx)
+            print0(f"Added new block at layer {layer_idx}")
 
-            # for param in layer.parameters():
-            #     param.requires_grad = False
             self.prev_gate_level = gate_level
             print0(f"New gate level: {gate_level}")
+
+            if self.config.freeze_previous_weights:
+                # pyrefly: ignore
+                for param in self.transformer.h[layer_idx].parameters():
+                    param.requires_grad = False
+
+                if self.prev_gate_level == 0:
+                    # also freeze the embedding weights
+                    for param in self.transformer.wte.parameters():  # pyrefly: ignore
+                        param.requires_grad = False
+
         return gate_level
 
     def forward(
@@ -442,16 +462,19 @@ class WeightApproxGPT(GPT):
         x = self.transformer.wte(idx)
         x = norm(x)
         gate_level = step // self.freeze_every if step is not None else 0
-        if self.reverse_train_order and gate_level is not None:
-            gate_level = max(len(self.transformer.h) - gate_level - 1, 0)
+        # Remove reverse training order logic since we only support forward direction
+        # if self.reverse_train_order and gate_level is not None:
+        #     gate_level = max(len(self.transformer.h) - gate_level - 1, 0)
 
         self.check_gate_level(gate_level)
 
         for i, block in enumerate(self.transformer.h):
-            if not self.reverse_train_order and i > gate_level:
+            # Only support forward direction - process blocks up to gate_level
+            if i > gate_level:
                 break
-            if self.reverse_train_order and i < gate_level:
-                continue
+            # Remove reverse training order logic
+            # if self.reverse_train_order and i < gate_level:
+            #     continue
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
