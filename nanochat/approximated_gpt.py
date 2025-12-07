@@ -370,13 +370,6 @@ class WeightApproxGPT(GPT):
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
-        # TODO: figure out if I need this
-        # freeze the weights of all blocks except the first training layer
-        # loop = self.transformer.h if self.reverse_train_order else self.transformer.h[::-1]
-        # for block in loop[1:]:
-        #     for param in block.parameters():
-        #         param.requires_grad = False
-
     def setup_optimizers(
         self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0
     ):
