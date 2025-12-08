@@ -4,7 +4,7 @@ Test script for Linformer implementation
 """
 
 import torch
-from nanochat.approximated_gpt import GPTConfig, WeightApproxGPT
+from nanochat.approximated_gpt import WeightApproxGPTConfig, WeightApproxGPT
 
 
 def test_linformer_basic():
@@ -12,7 +12,7 @@ def test_linformer_basic():
     print("Testing Linformer implementation...")
 
     # Create config with Linformer enabled
-    config = GPTConfig(
+    config = WeightApproxGPTConfig(
         sequence_len=256,
         n_embd=128,
         n_head=4,
@@ -57,7 +57,7 @@ def test_linformer_vs_standard():
     print("\nTesting Linformer vs standard attention...")
 
     # Create two identical configs, one with Linformer, one without
-    config_std = GPTConfig(
+    config_std = WeightApproxGPTConfig(
         sequence_len=256,
         n_embd=256,
         n_head=8,
@@ -70,7 +70,7 @@ def test_linformer_vs_standard():
         mlp_proj_rank=16,
     )
 
-    config_lin = GPTConfig(
+    config_lin = WeightApproxGPTConfig(
         sequence_len=256,
         n_embd=256,
         n_head=8,
@@ -138,7 +138,7 @@ def test_different_sharing_strategies():
     for strategy in sharing_strategies:
         print(f"  Testing {strategy} sharing...")
 
-        config = GPTConfig(
+        config = WeightApproxGPTConfig(
             sequence_len=128,
             n_embd=256,
             n_head=8,
@@ -198,7 +198,7 @@ def test_parameter_counts():
 
     param_counts = {}
     for strategy in ["none", "headwise", "keyvalue", "layerwise"]:
-        config = GPTConfig(**base_config, linformer_sharing=strategy)
+        config = WeightApproxGPTConfig(**base_config, linformer_sharing=strategy)
         model = WeightApproxGPT(config, freeze_every=1000)
         linformer_params = sum(
             p.numel() for n, p in model.named_parameters() if "linformer" in n.lower()
@@ -222,7 +222,7 @@ def test_with_layer_building():
     """Test Linformer works with build_by_layer=True"""
     print("\nTesting Linformer with layer building...")
 
-    config = GPTConfig(
+    config = WeightApproxGPTConfig(
         sequence_len=128,
         n_embd=128,
         n_head=4,
@@ -275,7 +275,7 @@ def test_variable_sequence_length():
     """Test Linformer with sequences shorter than config.sequence_len"""
     print("\nTesting variable sequence lengths...")
 
-    config = GPTConfig(
+    config = WeightApproxGPTConfig(
         sequence_len=256,  # Max sequence length
         n_embd=128,
         n_head=4,

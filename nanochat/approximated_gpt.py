@@ -23,11 +23,11 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
-from nanochat.gpt import GPT
+from nanochat.gpt import GPT, MLP
 
 
 @dataclass
-class GPTConfig:
+class WeightApproxGPTConfig:
     sequence_len: int = 1024
     vocab_size: int = 50304
     n_layer: int = 12
@@ -38,6 +38,7 @@ class GPTConfig:
     approx_type: Literal["svd", "abba"] = (
         "svd"  # Type of linear approximation: "svd" or "abba"
     )
+    approx_mlp_proj: bool = True  # Whether to use low-rank MLP weights approximation
     mlp_proj_rank: int = 16  # Rank for low-rank MLP weights approximation
     # Layer-wise training settings
     build_by_layer: bool = True  # Whether to build model layer-by-layer incrementally
@@ -86,7 +87,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -107,45 +108,13 @@ class CausalSelfAttention(nn.Module):
             v.transpose(1, 2),
         )  # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
 
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2)  # number of queries in this forward pass
-        # number of keys/values in total (in the cache + current forward pass)
-        Tk = k.size(2)
-
-        # Attention: queries attend to keys/values autoregressively. A few cases to handle:
+        # Attention with causal masking
         enable_gqa = (
             self.n_head != self.n_kv_head
         )  # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
-            # During training (no KV cache), attend as usual with causal attention
-            # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, enable_gqa=enable_gqa
-            )
-        elif Tq == 1:
-            # During inference but with a single query in this forward pass:
-            # The query has to attend to all the keys/values in the cache
-            y = F.scaled_dot_product_attention(
-                q, k, v, is_causal=False, enable_gqa=enable_gqa
-            )
-        else:
-            # During inference AND we have a chunk of queries in this forward pass:
-            # First, each query attends to all the cached keys/values (i.e. full prefix)
-            attn_mask = torch.zeros(
-                (Tq, Tk), dtype=torch.bool, device=q.device
-            )  # True = keep, False = mask
-            prefix_len = Tk - Tq
-            if prefix_len > 0:  # can't be negative but could be zero
-                attn_mask[:, :prefix_len] = True
-            # Then, causal attention within this chunk
-            attn_mask[:, prefix_len:] = torch.tril(
-                torch.ones((Tq, Tq), dtype=torch.bool, device=q.device)
-            )
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa
-            )
+        y = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa
+        )
 
         # Re-assemble the heads side by side and project back to residual stream
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -185,7 +154,9 @@ class LinformerProjection(nn.Module):
             # F projects values: (proj_dim, seq_len)
             self.F = nn.Parameter(torch.randn(n_kv_head, proj_dim, seq_len) * 0.02)
 
-    def project_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def project_kv(
+        self, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project keys and values to lower dimension.
 
         Args:
@@ -262,7 +233,7 @@ class LinformerCausalSelfAttention(nn.Module):
                 share_kv=share_kv,
             )
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, cos_sin):
         B, T, C = x.size()
 
         # Project input to get queries, keys, and values
@@ -283,7 +254,10 @@ class LinformerCausalSelfAttention(nn.Module):
 
         # Apply Linformer projections to K and V
         # Handle headwise/keyvalue sharing by expanding projection
-        if self.sharing in ("headwise", "keyvalue") and self.linformer_proj.n_kv_head == 1:
+        if (
+            self.sharing in ("headwise", "keyvalue")
+            and self.linformer_proj.n_kv_head == 1
+        ):
             # Expand single projection to all heads
             k_proj, v_proj = self.linformer_proj.project_kv(
                 k[:, :1, :, :], v[:, :1, :, :]
@@ -294,7 +268,9 @@ class LinformerCausalSelfAttention(nn.Module):
             # But we need to project each head's K,V with the shared projection
             # Actually, let's redo this properly:
             E = self.linformer_proj.E[:, :, :T]  # (1, proj_dim, T)
-            F_mat = E if self.linformer_proj.share_kv else self.linformer_proj.F[:, :, :T]
+            F_mat = (
+                E if self.linformer_proj.share_kv else self.linformer_proj.F[:, :, :T]
+            )
             # Expand and apply to all heads
             k_proj = einsum(E.squeeze(0), k, "k t, b h t d -> b h k d")
             v_proj = einsum(F_mat.squeeze(0), v, "k t, b h t d -> b h k d")
@@ -314,7 +290,7 @@ class LinformerCausalSelfAttention(nn.Module):
             v_proj = v_proj.repeat_interleave(n_rep, dim=1)
 
         # Attention scores: (B, n_head, T, proj_dim)
-        scale = self.head_dim ** -0.5
+        scale = self.head_dim**-0.5
         attn = einsum(q, k_proj, "b h t d, b h k d -> b h t k") * scale
 
         # Apply causal mask (approximate - positions in k_proj are mixed)
@@ -467,28 +443,31 @@ class ApproxWeightMLP(nn.Module):
 class ApproxWeightBlock(nn.Module):
     def __init__(
         self,
-        config,
+        config: WeightApproxGPTConfig,
         layer_idx,
         shared_linformer_proj: LinformerProjection | None = None,
     ):
         super().__init__()
         # Choose attention type based on config
         if config.use_linformer:
-            self.attn = LinformerCausalSelfAttention(
+            self.attn: nn.Module = LinformerCausalSelfAttention(
                 config, layer_idx, shared_projection=shared_linformer_proj
             )
         else:
-            self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = ApproxWeightMLP(config)
+            self.attn: nn.Module = CausalSelfAttention(config, layer_idx)
+        if config.approx_mlp_proj:
+            self.mlp: nn.Module = ApproxWeightMLP(config)
+        else:
+            self.mlp: nn.Module = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, cos_sin):
+        x = x + self.attn(norm(x), cos_sin)
         x = x + self.mlp(norm(x))
         return x
 
 
 class WeightApproxGPT(GPT):
-    def __init__(self, config, freeze_every: int):
+    def __init__(self, config: WeightApproxGPTConfig, freeze_every: int):
         nn.Module.__init__(self)
         self.config = config
 
@@ -571,8 +550,13 @@ class WeightApproxGPT(GPT):
         )
         if self.config.copy_block_weights:
             # Only copy non-linformer weights when using shared projection
-            prev_state = self.transformer.h[layer_idx - 1].state_dict()  # pyrefly: ignore
-            if self.config.use_linformer and self.config.linformer_sharing == "layerwise":
+            prev_state = self.transformer.h[
+                layer_idx - 1
+            ].state_dict()  # pyrefly: ignore
+            if (
+                self.config.use_linformer
+                and self.config.linformer_sharing == "layerwise"
+            ):
                 # Filter out linformer_proj parameters (they're shared, not copied)
                 prev_state = {
                     k: v for k, v in prev_state.items() if "linformer_proj" not in k
@@ -730,9 +714,7 @@ class WeightApproxGPT(GPT):
 
         return gate_level
 
-    def forward(
-        self, idx, targets=None, kv_cache=None, loss_reduction="mean", step=None
-    ):
+    def forward(self, idx, targets=None, loss_reduction="mean", step=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -743,12 +725,10 @@ class WeightApproxGPT(GPT):
             f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         )
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = (
-            self.cos[:, T0 : T0 + T],
-            self.sin[:, T0 : T0 + T],
-        )  # truncate cache to current sequence length
+            self.cos[:, :T],
+            self.sin[:, :T],
+        )  # truncate to current sequence length
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
@@ -764,7 +744,7 @@ class WeightApproxGPT(GPT):
             # Only support forward direction - process blocks up to gate_level
             if i > gate_level:
                 break
-            x = block(x, cos_sin, kv_cache)
+            x = block(x, cos_sin)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
