@@ -68,8 +68,6 @@ class TrainSettings(BaseSettings):
     # optionally override the model tag for the output checkpoint directory name
     model_tag: str = ""
 
-    reverse_train_order: bool = False
-
     model_config = SettingsConfigDict(env_prefix="TRAIN_")
 
     @classmethod

@@ -24,4 +24,3 @@ core_metric_max_per_task = 500
 sample_every = 2000
 save_every = -1
 model_tag = ""
-reverse_train_order = false

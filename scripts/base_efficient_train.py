@@ -16,7 +16,6 @@ import sys
 import time
 import gc
 from pathlib import Path
-from contextlib import nullcontext
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -37,7 +36,6 @@ from nanochat.common import (
     DummyWandb,
     print_banner,
     get_base_dir,
-    autodetect_device_type,
 )
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -65,20 +63,16 @@ def parse_settings():
     return TrainSettings.load_or_create().model_copy(update=updated_params)
 
 
-def setup_compute(device_type):
+def setup_compute():
     """Initialize DDP/compute context.
 
     Returns:
         tuple: (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, autocast_ctx, synchronize, get_max_memory)
     """
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    autocast_ctx = (
-        torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
-        if device_type == "cuda"
-        else nullcontext()
-    )
-    synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-    get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init("cuda")
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    synchronize = torch.cuda.synchronize
+    get_max_memory = torch.cuda.max_memory_allocated
 
     return (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, autocast_ctx, synchronize, get_max_memory)
 
@@ -156,7 +150,6 @@ def create_model(settings, model_config_kwargs, device, checkpoint_dir, resume_f
         model = WeightApproxGPT(
             model_config,
             freeze_every=freeze_every,
-            reverse_train_order=settings.reverse_train_order,
         )
     model.to_empty(device=device)
     model.init_weights()
@@ -536,7 +529,6 @@ def main():
     user_config = settings.model_dump()
 
     # Extract commonly used settings
-    device_type = settings.device_type
     max_seq_len = settings.max_seq_len
     num_iterations = settings.num_iterations
     device_batch_size = settings.device_batch_size
@@ -546,7 +538,7 @@ def main():
 
     # Setup compute
     (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device,
-     autocast_ctx, synchronize, get_max_memory) = setup_compute(device_type)
+     autocast_ctx, synchronize, get_max_memory) = setup_compute()
     master_process = ddp_rank == 0
 
     # Setup wandb
