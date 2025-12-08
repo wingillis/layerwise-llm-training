@@ -364,68 +364,18 @@ def get_muon_momentum(it):
     return momentum
 
 
-def _reconstruct_svd_weight(svd_layer: ApproxLinearSVD) -> torch.Tensor:
-    """
-    Reconstruct dense weight from SVD approximation.
-
-    Given: U (out_features, rank), V (in_features, rank)
-    Reconstruct: W = U @ V.T
-
-    Args:
-        svd_layer: ApproxLinearSVD layer with trained U and V parameters
-
-    Returns:
-        Reconstructed dense weight tensor of shape (out_features, in_features)
-    """
-    with torch.no_grad():
-        return svd_layer.U @ svd_layer.V.T
-
-
-def _reconstruct_abba_weight(abba_layer: ApproxLinearABBA) -> torch.Tensor:
-    """
-    Reconstruct dense weight from ABBA approximation.
-
-    Given: A1, A2 (rank, in_features), B1, B2 (out_features, rank)
-    Using Khatri-Rao factorization as described in the paper:
-    W = (B1 ⊙_r B2) @ (A1^T ⊙_r A2^T)^T
-
-    Args:
-        abba_layer: ApproxLinearABBA layer with trained A1, A2, B1, B2 parameters
-
-    Returns:
-        Reconstructed dense weight tensor of shape (out_features, in_features)
-    """
-    with torch.no_grad():
-        # B_kr = B1 ⊙_r B2
-        B_kr = einsum(abba_layer.B1, abba_layer.B2, "o r1, o r2 -> o r1 r2")
-        B_kr = rearrange(B_kr, "o r1 r2 -> o (r1 r2)")
-
-        # A_kr = (A1^T ⊙_r A2^T)^T
-        A_kr = einsum(abba_layer.A1, abba_layer.A2, "r1 i, r2 i -> r1 r2 i")
-        A_kr = rearrange(A_kr, "r1 r2 i -> (r1 r2) i")
-
-        # Final weight: W = B_kr @ A_kr
-        return B_kr @ A_kr
-
-
-def _convert_linear_weight(approx_linear, in_features: int, out_features: int) -> torch.Tensor:
+def _convert_linear_weight(approx_linear) -> torch.Tensor:
     """
     Convert an approximated linear layer weight to dense form.
 
     Args:
         approx_linear: The approximated linear layer (ApproxLinearSVD or ApproxLinearABBA)
-        in_features: Input dimension of the linear layer
-        out_features: Output dimension of the linear layer
 
     Returns:
         Dense weight tensor of shape (out_features, in_features)
     """
-    if isinstance(approx_linear.linear, ApproxLinearSVD):
-        return _reconstruct_svd_weight(approx_linear.linear)
-    elif isinstance(approx_linear.linear, ApproxLinearABBA):
-        return _reconstruct_abba_weight(approx_linear.linear)
-    else:
-        raise ValueError(f"Unsupported approximation type: {type(approx_linear.linear)}")
+    # Use the reconstruct_weight method from the approximation class
+    return approx_linear.linear.reconstruct_weight()
 
 
 def materialize_weights(
@@ -487,13 +437,17 @@ def materialize_weights(
             dense_model.transformer.wte.weight.data = approx_model.transformer.wte.weight.data
             dense_model.lm_head.weight.data = approx_model.lm_head.weight.data
 
-        # Copy rotary embeddings
+        # Copy rotary embeddings and ensure they're in bfloat16
         if copy_weights:
             dense_model.cos.data.copy_(approx_model.cos.data)
             dense_model.sin.data.copy_(approx_model.sin.data)
         else:
             dense_model.cos.data = approx_model.cos.data
             dense_model.sin.data = approx_model.sin.data
+
+        # Ensure rotary embeddings are in bfloat16 as required by GPT
+        dense_model.cos = dense_model.cos.bfloat16()
+        dense_model.sin = dense_model.sin.bfloat16()
 
         # Convert each layer
         for i, (approx_block, dense_block) in enumerate(zip(approx_model.transformer.h, dense_model.transformer.h)):
@@ -528,9 +482,7 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
         if hasattr(approx_attn.c_q, 'linear'):
             # Approximated linear layer
             dense_attn.c_q.weight.data = _convert_linear_weight(
-                approx_attn.c_q,
-                approx_attn.c_q.linear.in_features,
-                approx_attn.c_q.linear.out_features
+                approx_attn.c_q
             ).to(device=dense_attn.c_q.weight.device, dtype=dense_attn.c_q.weight.dtype)
         else:
             # Standard linear layer
@@ -543,9 +495,7 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
         if hasattr(approx_attn.c_k, 'linear'):
             # Approximated linear layer
             dense_attn.c_k.weight.data = _convert_linear_weight(
-                approx_attn.c_k,
-                approx_attn.c_k.linear.in_features,
-                approx_attn.c_k.linear.out_features
+                approx_attn.c_k
             ).to(device=dense_attn.c_k.weight.device, dtype=dense_attn.c_k.weight.dtype)
         else:
             # Standard linear layer
@@ -558,9 +508,7 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
         if hasattr(approx_attn.c_v, 'linear'):
             # Approximated linear layer
             dense_attn.c_v.weight.data = _convert_linear_weight(
-                approx_attn.c_v,
-                approx_attn.c_v.linear.in_features,
-                approx_attn.c_v.linear.out_features
+                approx_attn.c_v
             ).to(device=dense_attn.c_v.weight.device, dtype=dense_attn.c_v.weight.dtype)
         else:
             # Standard linear layer
@@ -573,9 +521,7 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
         if hasattr(approx_attn.c_proj, 'linear'):
             # Approximated linear layer
             dense_attn.c_proj.weight.data = _convert_linear_weight(
-                approx_attn.c_proj,
-                approx_attn.c_proj.linear.in_features,
-                approx_attn.c_proj.linear.out_features
+                approx_attn.c_proj
             ).to(device=dense_attn.c_proj.weight.device, dtype=dense_attn.c_proj.weight.dtype)
         else:
             # Standard linear layer
@@ -591,15 +537,11 @@ def _convert_mlp_weights(approx_mlp, dense_mlp, copy_weights: bool = True):
     if isinstance(approx_mlp, ApproxWeightMLP):
         # ApproxWeightMLP case
         dense_mlp.c_fc.weight.data = _convert_linear_weight(
-            approx_mlp.c_fc,
-            approx_mlp.c_fc.linear.in_features,
-            approx_mlp.c_fc.linear.out_features
+            approx_mlp.c_fc
         ).to(device=dense_mlp.c_fc.weight.device, dtype=dense_mlp.c_fc.weight.dtype)
 
         dense_mlp.c_proj.weight.data = _convert_linear_weight(
-            approx_mlp.c_proj,
-            approx_mlp.c_proj.linear.in_features,
-            approx_mlp.c_proj.linear.out_features
+            approx_mlp.c_proj
         ).to(device=dense_mlp.c_proj.weight.device, dtype=dense_mlp.c_proj.weight.dtype)
     else:
         # Standard MLP case - just copy weights directly

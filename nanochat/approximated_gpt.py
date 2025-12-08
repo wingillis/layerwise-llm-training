@@ -354,6 +354,19 @@ class ApproxLinearSVD(nn.Module):
             result = result + self.bias
         return result
 
+    def reconstruct_weight(self) -> torch.Tensor:
+        """
+        Reconstruct dense weight from SVD approximation.
+
+        Given: U (out_features, rank), V (in_features, rank)
+        Reconstruct: W = U @ V.T
+
+        Returns:
+            Reconstructed dense weight tensor of shape (out_features, in_features)
+        """
+        with torch.no_grad():
+            return self.U @ self.V.T
+
 
 class ApproxLinearABBA(nn.Module):
     def __init__(self, in_features, out_features, rank: int = 16, bias: bool = False):
@@ -413,6 +426,29 @@ class ApproxLinearABBA(nn.Module):
             result = result + self.bias
 
         return result
+
+    def reconstruct_weight(self) -> torch.Tensor:
+        """
+        Reconstruct dense weight from ABBA approximation.
+
+        Given: A1, A2 (rank, in_features), B1, B2 (out_features, rank)
+        Using Khatri-Rao factorization as described in the paper:
+        W = (B1 ⊙_r B2) @ (A1^T ⊙_r A2^T)^T
+
+        Returns:
+            Reconstructed dense weight tensor of shape (out_features, in_features)
+        """
+        with torch.no_grad():
+            # B_kr = B1 ⊙_r B2
+            B_kr = einsum(self.B1, self.B2, "o r1, o r2 -> o r1 r2")
+            B_kr = rearrange(B_kr, "o r1 r2 -> o (r1 r2)")
+
+            # A_kr = (A1^T ⊙_r A2^T)^T
+            A_kr = einsum(self.A1, self.A2, "r1 i, r2 i -> r1 r2 i")
+            A_kr = rearrange(A_kr, "r1 r2 i -> (r1 r2) i")
+
+            # Final weight: W = B_kr @ A_kr
+            return B_kr @ A_kr
 
 
 class ApproxWeightMLP(nn.Module):
@@ -571,9 +607,33 @@ class WeightApproxGPT(GPT):
         # zero out classifier weights
         torch.nn.init.zeros_(self.lm_head.weight)
         # zero out c_proj weights in all blocks
-        for block in self.transformer.h:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+        for block in self.transformer.h:  # pyrefly: ignore
+            # Handle approximated c_proj weights
+            if hasattr(block.mlp.c_proj, 'linear'):
+                if hasattr(block.mlp.c_proj.linear, 'U'):
+                    # SVD approximation - zero out U
+                    torch.nn.init.zeros_(block.mlp.c_proj.linear.U)
+                elif hasattr(block.mlp.c_proj.linear, 'B1'):
+                    # ABBA approximation - zero out B1 and B2
+                    torch.nn.init.zeros_(block.mlp.c_proj.linear.B1)
+                    torch.nn.init.zeros_(block.mlp.c_proj.linear.B2)
+            else:
+                # Standard linear layer
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+            # Handle attention c_proj
+            if hasattr(block.attn.c_proj, 'linear'):
+                if hasattr(block.attn.c_proj.linear, 'U'):
+                    # SVD approximation - zero out U
+                    torch.nn.init.zeros_(block.attn.c_proj.linear.U)
+                elif hasattr(block.attn.c_proj.linear, 'B1'):
+                    # ABBA approximation - zero out B1 and B2
+                    torch.nn.init.zeros_(block.attn.c_proj.linear.B1)
+                    torch.nn.init.zeros_(block.attn.c_proj.linear.B2)
+            else:
+                # Standard linear layer
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
