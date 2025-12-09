@@ -193,7 +193,10 @@ def _test_batch_size_fit(
 
 def _config_to_dict(config):
     """Convert a config (dataclass or Pydantic model) to a dict."""
-    if hasattr(config, "model_dump"):
+    if isinstance(config, dict):
+        # Already a dict
+        return config
+    elif hasattr(config, "model_dump"):
         # Pydantic v2
         return config.model_dump()
     else:

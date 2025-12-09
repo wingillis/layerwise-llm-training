@@ -32,7 +32,7 @@ class TrainSettings(BaseSettings):
     # Whether new blocks copy weights from previous layer
     copy_block_weights: bool = True
     # Whether to freeze previous blocks during training
-    freeze_previous_weights: bool = False
+    freeze_previous_weights: bool = True
     # Whether to use Linformer attention
     use_linformer: bool = False
     # Projection dimension k for Linformer
