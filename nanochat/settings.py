@@ -21,6 +21,24 @@ class TrainSettings(BaseSettings):
     depth: int = 20
     # max context length
     max_seq_len: int = 2048
+    # Type of linear approximation: "svd" or "abba"
+    approx_type: str = "svd"
+    # Whether to use low-rank MLP weights approximation
+    approx_mlp_proj: bool = True
+    # Rank for low-rank MLP weights approximation
+    mlp_proj_rank: int = 16
+    # Whether to build model layer-by-layer incrementally
+    build_by_layer: bool = True
+    # Whether new blocks copy weights from previous layer
+    copy_block_weights: bool = True
+    # Whether to freeze previous blocks during training
+    freeze_previous_weights: bool = False
+    # Whether to use Linformer attention
+    use_linformer: bool = False
+    # Projection dimension k for Linformer
+    linformer_proj_dim: int = 128
+    # Parameter sharing strategy for Linformer projections
+    linformer_sharing: str = "layerwise"
     # Training horizon. Only one of these 3 will be used, in this order of precedence.
     # explicit number of steps of the optimization (-1 = disable)
     num_iterations: int = -1

@@ -12,13 +12,12 @@ python -m scripts.base_efficient_train --depth=4 --max_seq_len=512 --device_batc
 """
 
 import os
-import sys
 import time
-import gc
 from pathlib import Path
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
+import tyro
 import wandb
 import torch
 from tqdm import tqdm
@@ -50,17 +49,13 @@ from nanochat.settings import TrainSettings
 from scripts.base_eval import evaluate_model
 
 
-def parse_settings():
+def parse_settings(settings: TrainSettings):
     """Parse CLI arguments and load/create settings."""
-    updated_params = {}
-    if len(sys.argv) > 1:
-        for item in sys.argv[1:]:
-            k, v = item.split("=")
-            k = k.replace("--", "").replace("-", "_")
-            updated_params[k] = v
-            print(f"Setting {k} to {v}")
+    updated_params = (
+        TrainSettings().load_or_create().model_copy(update=settings.model_dump())
+    )
 
-    return TrainSettings.load_or_create().model_copy(update=updated_params)
+    return updated_params
 
 
 def setup_compute():
@@ -74,7 +69,16 @@ def setup_compute():
     synchronize = torch.cuda.synchronize
     get_max_memory = torch.cuda.max_memory_allocated
 
-    return (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, autocast_ctx, synchronize, get_max_memory)
+    return (
+        ddp,
+        ddp_rank,
+        ddp_local_rank,
+        ddp_world_size,
+        device,
+        autocast_ctx,
+        synchronize,
+        get_max_memory,
+    )
 
 
 def setup_wandb(settings, master_process, user_config):
@@ -100,7 +104,14 @@ def setup_tokenizer(device):
     return (tokenizer, token_bytes, vocab_size)
 
 
-def compute_model_config(settings, vocab_size, max_seq_len, ddp_world_size, device_batch_size, total_batch_size):
+def compute_model_config(
+    settings,
+    vocab_size,
+    max_seq_len,
+    ddp_world_size,
+    device_batch_size,
+    total_batch_size,
+):
     """Calculate model configuration and batch parameters.
 
     Returns:
@@ -122,9 +133,13 @@ def compute_model_config(settings, vocab_size, max_seq_len, ddp_world_size, devi
     assert total_batch_size % world_tokens_per_fwdbwd == 0
     grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 
-    print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
+    print0(
+        f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}"
+    )
     print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-    print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+    print0(
+        f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}"
+    )
 
     model_config_kwargs = dict(
         sequence_len=max_seq_len,
@@ -138,7 +153,15 @@ def compute_model_config(settings, vocab_size, max_seq_len, ddp_world_size, devi
     return (model_config_kwargs, num_layers, model_dim, grad_accum_steps)
 
 
-def create_model(settings, model_config_kwargs, device, checkpoint_dir, resume_from_step, ddp_rank, num_iterations):
+def create_model(
+    settings,
+    model_config_kwargs,
+    device,
+    checkpoint_dir,
+    resume_from_step,
+    ddp_rank,
+    num_iterations,
+):
     """Create model on meta device, move to device, init weights, and handle checkpoint loading.
 
     Returns:
@@ -172,32 +195,52 @@ def create_model(settings, model_config_kwargs, device, checkpoint_dir, resume_f
     num_flops_per_token = model.estimate_flops()
     print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-    return (model, orig_model, model_config, optimizer_data, meta_data, num_params, num_flops_per_token)
+    return (
+        model,
+        orig_model,
+        model_config,
+        optimizer_data,
+        meta_data,
+        num_params,
+        num_flops_per_token,
+    )
 
 
-def compute_training_iterations(settings, num_params, num_flops_per_token, total_batch_size, num_iterations):
+def compute_training_iterations(
+    settings, num_params, num_flops_per_token, total_batch_size, num_iterations
+):
     """Calculate number of training iterations based on settings.
 
     Returns:
         tuple: (num_iterations, total_tokens)
     """
-    assert num_iterations > 0 or settings.target_param_data_ratio > 0 or settings.target_flops > 0
+    assert (
+        num_iterations > 0
+        or settings.target_param_data_ratio > 0
+        or settings.target_flops > 0
+    )
 
     if num_iterations > 0:
         print0(f"Using user-provided number of iterations: {num_iterations:,}")
     elif settings.target_flops > 0:
-        num_iterations = round(settings.target_flops / (num_flops_per_token * total_batch_size))
+        num_iterations = round(
+            settings.target_flops / (num_flops_per_token * total_batch_size)
+        )
         print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
     elif settings.target_param_data_ratio > 0:
         target_tokens = settings.target_param_data_ratio * num_params
         num_iterations = target_tokens // total_batch_size
-        print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+        print0(
+            f"Calculated number of iterations from target data:param ratio: {num_iterations:,}"
+        )
     else:
         raise ValueError("No training horizon specified")
 
     total_tokens = total_batch_size * num_iterations
     print0(f"Total number of training tokens: {total_tokens:,}")
-    print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}")
+    print0(
+        f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}"
+    )
     print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
     return (num_iterations, total_tokens)
@@ -225,14 +268,15 @@ def setup_optimizers(model, settings, optimizer_data):
     return optimizers
 
 
-def setup_dataloaders(settings, device, meta_data, device_batch_size, max_seq_len):
+def setup_dataloaders(device, meta_data, device_batch_size, max_seq_len):
     """Create train loader and val loader builder.
 
     Returns:
         tuple: (train_loader, build_val_loader, x, y, dataloader_state_dict)
     """
-    base_dir = Path(get_base_dir() or ".")
-    dataloader_resume_state_dict = None if meta_data is None else meta_data["dataloader_state_dict"]
+    dataloader_resume_state_dict = (
+        None if meta_data is None else meta_data["dataloader_state_dict"]
+    )
 
     train_loader = tokenizing_distributed_data_loader_with_state(
         device_batch_size,
@@ -241,9 +285,12 @@ def setup_dataloaders(settings, device, meta_data, device_batch_size, max_seq_le
         device=device,
         resume_state_dict=dataloader_resume_state_dict,
     )
-    build_val_loader = lambda: tokenizing_distributed_data_loader(
-        device_batch_size, max_seq_len, split="val", device=device
-    )
+
+    def build_val_loader():
+        return tokenizing_distributed_data_loader(
+            device_batch_size, max_seq_len, split="val", device=device
+        )
+
     x, y, dataloader_state_dict = next(train_loader)  # kick off first batch load
 
     return (train_loader, build_val_loader, x, y, dataloader_state_dict)
@@ -284,21 +331,50 @@ def init_loop_state(meta_data, resume_from_step):
 
 
 def train_loop(
-    model, orig_model, optimizers, train_loader, build_val_loader,
-    x, y, dataloader_state_dict, tokenizer, token_bytes,
-    settings, user_config, model_config_kwargs, checkpoint_dir,
-    num_iterations, total_batch_size, grad_accum_steps, num_flops_per_token, freeze_every,
-    device, autocast_ctx, synchronize, get_max_memory,
-    wandb_run, master_process, ddp_rank, ddp_world_size,
-    get_lr_multiplier, loop_state,
+    model,
+    orig_model,
+    optimizers,
+    train_loader,
+    build_val_loader,
+    x,
+    y,
+    dataloader_state_dict,
+    tokenizer,
+    token_bytes,
+    settings,
+    user_config,
+    model_config_kwargs,
+    checkpoint_dir,
+    num_iterations,
+    total_batch_size,
+    grad_accum_steps,
+    num_flops_per_token,
+    freeze_every,
+    device,
+    autocast_ctx,
+    synchronize,
+    get_max_memory,
+    wandb_run,
+    master_process,
+    ddp_rank,
+    ddp_world_size,
+    get_lr_multiplier,
+    loop_state,
 ):
     """Main training loop."""
+
+    device_batch_size = find_optimal_batch_size(
+        user_config,
+        device,
+        "cuda",
+        settings.max_seq_len,
+        256,
+    )
     step = loop_state["step"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-    device_batch_size = settings.device_batch_size
     max_seq_len = settings.max_seq_len
     eval_every = settings.eval_every
     eval_tokens = settings.eval_tokens
@@ -322,35 +398,43 @@ def train_loop(
         if last_step or step % eval_every == 0:
             model.eval()
             val_loader = build_val_loader()
-            eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+            eval_steps = eval_tokens // (
+                device_batch_size * max_seq_len * ddp_world_size
+            )
             with autocast_ctx:
                 val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, step)
             print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
             if val_bpb < min_val_bpb:
                 min_val_bpb = val_bpb
-            wandb_run.log({
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "total_training_time": total_training_time,
-                "val/bpb": val_bpb,
-            })
+            wandb_run.log(
+                {
+                    "step": step,
+                    "total_training_flops": flops_so_far,
+                    "total_training_time": total_training_time,
+                    "val/bpb": val_bpb,
+                }
+            )
             model.train()
 
         # Evaluate CORE metric
         results = {}
-        if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
+        if core_metric_every > 0 and (
+            last_step or (step > 0 and step % core_metric_every == 0)
+        ):
             model.eval()
             with autocast_ctx:
                 results = evaluate_model(
                     orig_model, tokenizer, device, max_per_task=core_metric_max_per_task
                 )
             print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-            wandb_run.log({
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "core_metric": results["core_metric"],
-                "centered_results": results["centered_results"],
-            })
+            wandb_run.log(
+                {
+                    "step": step,
+                    "total_training_flops": flops_so_far,
+                    "core_metric": results["core_metric"],
+                    "centered_results": results["centered_results"],
+                }
+            )
             model.train()
 
         # Sample from model
@@ -369,12 +453,19 @@ def train_loop(
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
                 with autocast_ctx:
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    sample, _ = engine.generate_batch(
+                        tokens, num_samples=1, max_tokens=16, temperature=0
+                    )
                 print0(tokenizer.decode(sample[0]))
             model.train()
 
         # Save checkpoint
-        if last_step or (step > 0 and step != resume_from_step and save_every > 0 and step % save_every == 0):
+        if last_step or (
+            step > 0
+            and step != resume_from_step
+            and save_every > 0
+            and step % save_every == 0
+        ):
             save_checkpoint(
                 checkpoint_dir,
                 step,
@@ -414,7 +505,9 @@ def train_loop(
         # Gradient clipping
         grad_clip_enabled = grad_clip > 0.0
         if grad_clip_enabled:
-            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+            grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                orig_model.parameters(), grad_clip
+            )
             grad_norm = grad_norm_tensor.item()
 
         # Step optimizers
@@ -434,9 +527,10 @@ def train_loop(
 
         # Logging
         ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
+        smooth_train_loss = (
+            ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item()
+        )
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * step / num_iterations
         tok_per_sec = int(total_batch_size / dt)
         flops_per_sec = num_flops_per_token * total_batch_size / dt
         promised_flops_per_sec_h100 = 989e12 * ddp_world_size
@@ -467,6 +561,7 @@ def train_loop(
             wandb_run.log(log_data)
 
         step += 1
+    pbar.close()
 
     return {
         "min_val_bpb": min_val_bpb,
@@ -479,9 +574,22 @@ def train_loop(
 
 
 def log_final_results(
-    get_max_memory, total_training_time, min_val_bpb, val_bpb, results,
-    user_config, num_params, num_flops_per_token, num_iterations, total_tokens,
-    total_batch_size, ddp_world_size, settings, mfu, flops_so_far, wandb_run,
+    get_max_memory,
+    total_training_time,
+    min_val_bpb,
+    val_bpb,
+    results,
+    user_config,
+    num_params,
+    num_flops_per_token,
+    num_iterations,
+    total_tokens,
+    total_batch_size,
+    ddp_world_size,
+    settings,
+    mfu,
+    flops_so_far,
+    wandb_run,
 ):
     """Print final stats, log to report, and cleanup."""
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
@@ -520,12 +628,12 @@ def log_final_results(
     wandb_run.finish()
 
 
-def main():
+def main(settings: TrainSettings):
     load_dotenv(override=True)
     print_banner()
 
     # Parse settings
-    settings = parse_settings()
+    settings = parse_settings(settings)
     user_config = settings.model_dump()
 
     # Extract commonly used settings
@@ -537,8 +645,16 @@ def main():
     model_tag = settings.model_tag
 
     # Setup compute
-    (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device,
-     autocast_ctx, synchronize, get_max_memory) = setup_compute()
+    (
+        ddp,
+        ddp_rank,
+        ddp_local_rank,
+        ddp_world_size,
+        device,
+        autocast_ctx,
+        synchronize,
+        get_max_memory,
+    ) = setup_compute()
     master_process = ddp_rank == 0
 
     # Setup wandb
@@ -548,8 +664,15 @@ def main():
     tokenizer, token_bytes, vocab_size = setup_tokenizer(device)
 
     # Compute model config
-    (model_config_kwargs, num_layers, model_dim, grad_accum_steps) = compute_model_config(
-        settings, vocab_size, max_seq_len, ddp_world_size, device_batch_size, total_batch_size
+    (model_config_kwargs, num_layers, model_dim, grad_accum_steps) = (
+        compute_model_config(
+            settings,
+            vocab_size,
+            max_seq_len,
+            ddp_world_size,
+            device_batch_size,
+            total_batch_size,
+        )
     )
 
     # Setup checkpoint directory
@@ -558,10 +681,22 @@ def main():
     checkpoint_dir = base_dir / "base_checkpoints" / output_dirname
 
     # Create model
-    (model, orig_model, model_config, optimizer_data, meta_data,
-     num_params, num_flops_per_token) = create_model(
-        settings, model_config_kwargs, device, checkpoint_dir,
-        resume_from_step, ddp_rank, num_iterations
+    (
+        model,
+        orig_model,
+        model_config,
+        optimizer_data,
+        meta_data,
+        num_params,
+        num_flops_per_token,
+    ) = create_model(
+        settings,
+        model_config_kwargs,
+        device,
+        checkpoint_dir,
+        resume_from_step,
+        ddp_rank,
+        num_iterations,
     )
 
     # Compute training iterations
@@ -574,7 +709,7 @@ def main():
 
     # Setup dataloaders
     (train_loader, build_val_loader, x, y, dataloader_state_dict) = setup_dataloaders(
-        settings, device, meta_data, device_batch_size, max_seq_len
+        device, meta_data, device_batch_size, max_seq_len
     )
 
     # Setup LR scheduler
@@ -588,22 +723,55 @@ def main():
 
     # Run training loop
     train_results = train_loop(
-        model, orig_model, optimizers, train_loader, build_val_loader,
-        x, y, dataloader_state_dict, tokenizer, token_bytes,
-        settings, user_config, model_config_kwargs, checkpoint_dir,
-        num_iterations, total_batch_size, grad_accum_steps, num_flops_per_token, freeze_every,
-        device, autocast_ctx, synchronize, get_max_memory,
-        wandb_run, master_process, ddp_rank, ddp_world_size,
-        get_lr_multiplier, loop_state,
+        model,
+        orig_model,
+        optimizers,
+        train_loader,
+        build_val_loader,
+        x,
+        y,
+        dataloader_state_dict,
+        tokenizer,
+        token_bytes,
+        settings,
+        user_config,
+        model_config_kwargs,
+        checkpoint_dir,
+        num_iterations,
+        total_batch_size,
+        grad_accum_steps,
+        num_flops_per_token,
+        freeze_every,
+        device,
+        autocast_ctx,
+        synchronize,
+        get_max_memory,
+        wandb_run,
+        master_process,
+        ddp_rank,
+        ddp_world_size,
+        get_lr_multiplier,
+        loop_state,
     )
 
     # Log final results
     log_final_results(
-        get_max_memory, train_results["total_training_time"], train_results["min_val_bpb"],
-        train_results["val_bpb"], train_results["results"],
-        user_config, num_params, num_flops_per_token, num_iterations, total_tokens,
-        total_batch_size, ddp_world_size, settings, train_results["mfu"],
-        train_results["flops_so_far"], wandb_run,
+        get_max_memory,
+        train_results["total_training_time"],
+        train_results["min_val_bpb"],
+        train_results["val_bpb"],
+        train_results["results"],
+        user_config,
+        num_params,
+        num_flops_per_token,
+        num_iterations,
+        total_tokens,
+        total_batch_size,
+        ddp_world_size,
+        settings,
+        train_results["mfu"],
+        train_results["flops_so_far"],
+        wandb_run,
     )
 
     # Cleanup
@@ -611,4 +779,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    config = tyro.cli(TrainSettings)
+    main(config)

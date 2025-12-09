@@ -39,11 +39,12 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
     Returns:
         Decorated function that checks cache before executing.
     """
+
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
             # Pop force_recalculate from kwargs (not passed to original function)
-            force_recalculate = kwargs.pop('force_recalculate', False)
+            force_recalculate = kwargs.pop("force_recalculate", False)
 
             # Determine cache directory
             base = Path(cache_dir) if cache_dir else Path(get_base_dir())
@@ -62,10 +63,12 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
                 with FileLock(str(lock_file)):
                     if cache_file.exists():
                         try:
-                            with open(cache_file, 'r', encoding='utf-8') as f:
+                            with open(cache_file, "r", encoding="utf-8") as f:
                                 cached = json.load(f)
-                            print0(f"[disk_cache] Cache hit for {func.__name__} (key={key_hash})")
-                            return cached['result']
+                            print0(
+                                f"[disk_cache] Cache hit for {func.__name__} (key={key_hash})"
+                            )
+                            return cached["result"]
                         except (json.JSONDecodeError, KeyError):
                             # Corrupted cache file, will recalculate
                             pass
@@ -76,16 +79,17 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
             # Save to cache (with file locking)
             with FileLock(str(lock_file)):
                 cache_entry = {
-                    'key': key_dict,
-                    'result': result,
-                    'timestamp': datetime.now().isoformat(),
+                    "key": key_dict,
+                    "result": result,
+                    "timestamp": datetime.now().isoformat(),
                 }
-                with open(cache_file, 'w', encoding='utf-8') as f:
+                with open(cache_file, "w", encoding="utf-8") as f:
                     json.dump(cache_entry, f, indent=2)
 
             return result
 
         return wrapper
+
     return decorator
 
 
@@ -96,7 +100,6 @@ def _test_batch_size_fit(
     device_type: str,
     max_seq_len: int,
     freeze_every: int,
-    reverse_train_order: bool,
     embedding_lr: float,
     unembedding_lr: float,
     matrix_lr: float,
@@ -115,8 +118,7 @@ def _test_batch_size_fit(
 
         # Create model (same pattern as main training)
         with torch.device("meta"):
-            test_model = WeightApproxGPT(config, freeze_every=freeze_every,
-                                   reverse_train_order=reverse_train_order)
+            test_model = WeightApproxGPT(config, freeze_every=freeze_every)
         test_model.to_empty(device=device)
         test_model.init_weights()
         test_model.train()
@@ -126,18 +128,31 @@ def _test_batch_size_fit(
             unembedding_lr=unembedding_lr,
             embedding_lr=embedding_lr,
             matrix_lr=matrix_lr,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
         )
 
         # Create dummy data
-        x = torch.randint(0, config.vocab_size, (batch_size, max_seq_len),
-                         dtype=torch.int32, device=device)
-        y = torch.randint(0, config.vocab_size, (batch_size, max_seq_len),
-                         dtype=torch.int64, device=device)
+        x = torch.randint(
+            0,
+            config.vocab_size,
+            (batch_size, max_seq_len),
+            dtype=torch.int32,
+            device=device,
+        )
+        y = torch.randint(
+            0,
+            config.vocab_size,
+            (batch_size, max_seq_len),
+            dtype=torch.int64,
+            device=device,
+        )
 
         # Forward pass with autocast
-        autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) \
-                       if device_type == "cuda" else nullcontext()
+        autocast_ctx = (
+            torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+            if device_type == "cuda"
+            else nullcontext()
+        )
         with autocast_ctx:
             loss = test_model(x, y, step=0)
 
@@ -178,7 +193,7 @@ def _test_batch_size_fit(
 
 def _config_to_dict(config):
     """Convert a config (dataclass or Pydantic model) to a dict."""
-    if hasattr(config, 'model_dump'):
+    if hasattr(config, "model_dump"):
         # Pydantic v2
         return config.model_dump()
     else:
@@ -186,24 +201,31 @@ def _config_to_dict(config):
         return dataclass_asdict(config)
 
 
-def _batch_size_key_fn(config, device, device_type, max_seq_len,
-                       freeze_every=None, reverse_train_order=False,
-                       embedding_lr=0.2, unembedding_lr=0.004,
-                       matrix_lr=0.02, weight_decay=0.0,
-                       safety_factor=0.9, **kwargs):
+def _batch_size_key_fn(
+    config,
+    device,
+    device_type,
+    max_seq_len,
+    freeze_every=None,
+    embedding_lr=0.2,
+    unembedding_lr=0.004,
+    matrix_lr=0.02,
+    weight_decay=0.0,
+    safety_factor=0.9,
+    **kwargs,
+):
     """Generate a cache key for find_optimal_batch_size from its arguments."""
     return {
-        'config_class': type(config).__name__,
-        'config': _config_to_dict(config),
-        'device_type': device_type,
-        'max_seq_len': max_seq_len,
-        'freeze_every': freeze_every,
-        'reverse_train_order': reverse_train_order,
-        'embedding_lr': embedding_lr,
-        'unembedding_lr': unembedding_lr,
-        'matrix_lr': matrix_lr,
-        'weight_decay': weight_decay,
-        'safety_factor': safety_factor,
+        "config_class": type(config).__name__,
+        "config": _config_to_dict(config),
+        "device_type": device_type,
+        "max_seq_len": max_seq_len,
+        "freeze_every": freeze_every,
+        "embedding_lr": embedding_lr,
+        "unembedding_lr": unembedding_lr,
+        "matrix_lr": matrix_lr,
+        "weight_decay": weight_decay,
+        "safety_factor": safety_factor,
     }
 
 
@@ -218,7 +240,6 @@ def find_optimal_batch_size(
     safety_factor: float = 0.9,
     verbose: bool = True,
     freeze_every: int | None = None,
-    reverse_train_order: bool = False,
     embedding_lr: float = 0.2,
     unembedding_lr: float = 0.004,
     matrix_lr: float = 0.02,
@@ -247,7 +268,6 @@ def find_optimal_batch_size(
         safety_factor: Multiply result by this factor for safety margin (default: 0.9)
         verbose: Print progress during search (default: True)
         freeze_every: freeze_every parameter for LayeredGPT (default: large number)
-        reverse_train_order: reverse_train_order for LayeredGPT (default: False)
         embedding_lr: Learning rate for embeddings (AdamW)
         unembedding_lr: Learning rate for lm_head (AdamW)
         matrix_lr: Learning rate for linear layers (Muon)
@@ -269,17 +289,21 @@ def find_optimal_batch_size(
         - Returns min_batch_size if even that doesn't fit (check logs!)
     """
     if device_type not in ["cuda", "cpu", "mps"]:
-        raise ValueError(f"device_type must be 'cuda', 'cpu', or 'mps', got '{device_type}'")
+        raise ValueError(
+            f"device_type must be 'cuda', 'cpu', or 'mps', got '{device_type}'"
+        )
 
     if freeze_every is None:
         freeze_every = 1000000  # Large number to effectively disable
 
     if verbose:
-        print0(f"\n{'='*60}")
+        print0(f"\n{'=' * 60}")
         print0(f"Finding optimal batch size for LayeredGPT")
-        print0(f"{'='*60}")
-        print0(f"Model config: n_layer={config.n_layer}, n_embd={config.n_embd}, "
-               f"n_head={config.n_head}, vocab_size={config.vocab_size}")
+        print0(f"{'=' * 60}")
+        print0(
+            f"Model config: n_layer={config.n_layer}, n_embd={config.n_embd}, "
+            f"n_head={config.n_head}, vocab_size={config.vocab_size}"
+        )
         print0(f"Sequence length: {max_seq_len}")
         print0(f"Search range: [{min_batch_size}, {max_batch_size}]")
         print0(f"Safety factor: {safety_factor:.1%}")
@@ -305,7 +329,6 @@ def find_optimal_batch_size(
             device_type=device_type,
             max_seq_len=max_seq_len,
             freeze_every=freeze_every,
-            reverse_train_order=reverse_train_order,
             embedding_lr=embedding_lr,
             unembedding_lr=unembedding_lr,
             matrix_lr=matrix_lr,
@@ -328,7 +351,7 @@ def find_optimal_batch_size(
 
     if verbose:
         print0(f"")
-        print0(f"{'='*60}")
+        print0(f"{'=' * 60}")
         print0(f"Results after {tests_run} tests:")
         print0(f"  Max working batch size: {best_working_batch}")
         print0(f"  Recommended (with {safety_factor:.0%} safety): {recommended}")
@@ -338,7 +361,7 @@ def find_optimal_batch_size(
             print0(f"WARNING: Only minimum batch size ({min_batch_size}) fits!")
             print0(f"         Consider reducing model size or sequence length.")
 
-        print0(f"{'='*60}\n")
+        print0(f"{'=' * 60}\n")
 
     return recommended
 
@@ -355,8 +378,10 @@ def lr_multiplier_factory(warmup_ratio, warmdown_ratio, num_iterations, final_lr
         else:
             progress = (num_iterations - it) / warmdown_iters
             return progress * 1.0 + (1 - progress) * final_lr_frac
+
     return get_lr_multiplier
-    
+
+
 # Momentum scheduler for Muon optimizer
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
@@ -382,7 +407,7 @@ def materialize_weights(
     approx_model: WeightApproxGPT,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
-    copy_weights: bool = True
+    copy_weights: bool = True,
 ) -> GPT:
     """
     Convert a trained WeightApproxGPT model to a standard GPT model with dense weights.
@@ -414,7 +439,7 @@ def materialize_weights(
             n_layer=approx_model.config.n_layer,
             n_head=approx_model.config.n_head,
             n_kv_head=approx_model.config.n_kv_head,
-            n_embd=approx_model.config.n_embd
+            n_embd=approx_model.config.n_embd,
         )
 
         # Create new GPT model
@@ -431,10 +456,14 @@ def materialize_weights(
 
         # Copy embeddings and lm_head weights directly
         if copy_weights:
-            dense_model.transformer.wte.weight.data.copy_(approx_model.transformer.wte.weight.data)
+            dense_model.transformer.wte.weight.data.copy_(
+                approx_model.transformer.wte.weight.data
+            )
             dense_model.lm_head.weight.data.copy_(approx_model.lm_head.weight.data)
         else:
-            dense_model.transformer.wte.weight.data = approx_model.transformer.wte.weight.data
+            dense_model.transformer.wte.weight.data = (
+                approx_model.transformer.wte.weight.data
+            )
             dense_model.lm_head.weight.data = approx_model.lm_head.weight.data
 
         # Copy rotary embeddings and ensure they're in bfloat16
@@ -450,9 +479,13 @@ def materialize_weights(
         dense_model.sin = dense_model.sin.bfloat16()
 
         # Convert each layer
-        for i, (approx_block, dense_block) in enumerate(zip(approx_model.transformer.h, dense_model.transformer.h)):
+        for i, (approx_block, dense_block) in enumerate(
+            zip(approx_model.transformer.h, dense_model.transformer.h)
+        ):
             # Convert attention weights
-            _convert_attention_weights(approx_block.attn, dense_block.attn, copy_weights)
+            _convert_attention_weights(
+                approx_block.attn, dense_block.attn, copy_weights
+            )
 
             # Convert MLP weights
             _convert_mlp_weights(approx_block.mlp, dense_block.mlp, copy_weights)
@@ -479,11 +512,11 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
     else:
         # Standard attention case - check if weights are approximated
         # For c_q (query projection)
-        if hasattr(approx_attn.c_q, 'linear'):
+        if hasattr(approx_attn.c_q, "linear"):
             # Approximated linear layer
-            dense_attn.c_q.weight.data = _convert_linear_weight(
-                approx_attn.c_q
-            ).to(device=dense_attn.c_q.weight.device, dtype=dense_attn.c_q.weight.dtype)
+            dense_attn.c_q.weight.data = _convert_linear_weight(approx_attn.c_q).to(
+                device=dense_attn.c_q.weight.device, dtype=dense_attn.c_q.weight.dtype
+            )
         else:
             # Standard linear layer
             if copy_weights:
@@ -492,11 +525,11 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
                 dense_attn.c_q.weight.data = approx_attn.c_q.weight.data
 
         # For c_k (key projection)
-        if hasattr(approx_attn.c_k, 'linear'):
+        if hasattr(approx_attn.c_k, "linear"):
             # Approximated linear layer
-            dense_attn.c_k.weight.data = _convert_linear_weight(
-                approx_attn.c_k
-            ).to(device=dense_attn.c_k.weight.device, dtype=dense_attn.c_k.weight.dtype)
+            dense_attn.c_k.weight.data = _convert_linear_weight(approx_attn.c_k).to(
+                device=dense_attn.c_k.weight.device, dtype=dense_attn.c_k.weight.dtype
+            )
         else:
             # Standard linear layer
             if copy_weights:
@@ -505,11 +538,11 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
                 dense_attn.c_k.weight.data = approx_attn.c_k.weight.data
 
         # For c_v (value projection)
-        if hasattr(approx_attn.c_v, 'linear'):
+        if hasattr(approx_attn.c_v, "linear"):
             # Approximated linear layer
-            dense_attn.c_v.weight.data = _convert_linear_weight(
-                approx_attn.c_v
-            ).to(device=dense_attn.c_v.weight.device, dtype=dense_attn.c_v.weight.dtype)
+            dense_attn.c_v.weight.data = _convert_linear_weight(approx_attn.c_v).to(
+                device=dense_attn.c_v.weight.device, dtype=dense_attn.c_v.weight.dtype
+            )
         else:
             # Standard linear layer
             if copy_weights:
@@ -518,11 +551,14 @@ def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = Tru
                 dense_attn.c_v.weight.data = approx_attn.c_v.weight.data
 
         # For c_proj (output projection)
-        if hasattr(approx_attn.c_proj, 'linear'):
+        if hasattr(approx_attn.c_proj, "linear"):
             # Approximated linear layer
             dense_attn.c_proj.weight.data = _convert_linear_weight(
                 approx_attn.c_proj
-            ).to(device=dense_attn.c_proj.weight.device, dtype=dense_attn.c_proj.weight.dtype)
+            ).to(
+                device=dense_attn.c_proj.weight.device,
+                dtype=dense_attn.c_proj.weight.dtype,
+            )
         else:
             # Standard linear layer
             if copy_weights:
@@ -536,13 +572,13 @@ def _convert_mlp_weights(approx_mlp, dense_mlp, copy_weights: bool = True):
     # Determine if we're dealing with approximated or standard MLP
     if isinstance(approx_mlp, ApproxWeightMLP):
         # ApproxWeightMLP case
-        dense_mlp.c_fc.weight.data = _convert_linear_weight(
-            approx_mlp.c_fc
-        ).to(device=dense_mlp.c_fc.weight.device, dtype=dense_mlp.c_fc.weight.dtype)
+        dense_mlp.c_fc.weight.data = _convert_linear_weight(approx_mlp.c_fc).to(
+            device=dense_mlp.c_fc.weight.device, dtype=dense_mlp.c_fc.weight.dtype
+        )
 
-        dense_mlp.c_proj.weight.data = _convert_linear_weight(
-            approx_mlp.c_proj
-        ).to(device=dense_mlp.c_proj.weight.device, dtype=dense_mlp.c_proj.weight.dtype)
+        dense_mlp.c_proj.weight.data = _convert_linear_weight(approx_mlp.c_proj).to(
+            device=dense_mlp.c_proj.weight.device, dtype=dense_mlp.c_proj.weight.dtype
+        )
     else:
         # Standard MLP case - just copy weights directly
         if copy_weights:
