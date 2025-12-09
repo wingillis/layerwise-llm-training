@@ -95,9 +95,8 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
 
 def _test_batch_size_fit(
     batch_size: int,
-    config,  # GPTConfig
-    device: torch.device,
-    device_type: str,
+    model: WeightApproxGPT,
+    device: str,
     max_seq_len: int,
     freeze_every: int,
     embedding_lr: float,
@@ -106,55 +105,86 @@ def _test_batch_size_fit(
     weight_decay: float,
 ) -> bool:
     """
-    Test if a specific batch size fits in memory with full training setup.
+    Test if a specific batch size fits in memory using the provided model.
 
-    Returns True if successful, False if OOM occurs.
+    This function tests batch size on an actual model without modifying its state.
+    It saves and restores:
+    - Model training/eval mode
+    - Existing optimizer states (AdamW and Muon)
+    - Gate level for incremental training models
+    - All gradients (cleared before and after testing)
+
+    The test performs a complete training step:
+    1. Forward pass with mixed precision
+    2. Backward pass (peak memory usage)
+    3. Optimizer step (allocates optimizer state)
+
+    Args:
+        batch_size: Batch size to test
+        model: WeightApproxGPT model to test with
+        device: Target device for testing
+        max_seq_len: Sequence length for test data
+        freeze_every: Layer freezing parameter
+        embedding_lr: Learning rate for embeddings (AdamW)
+        unembedding_lr: Learning rate for lm_head (AdamW)
+        matrix_lr: Learning rate for linear layers (Muon)
+        weight_decay: Weight decay for AdamW
+
+    Returns:
+        True if batch size fits in memory, False if OOM occurs
+
+    Raises:
+        RuntimeError: For unexpected errors (not OOM)
     """
     try:
         # Clean slate
-        if device_type == "cuda":
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
-        # Create model (same pattern as main training)
-        with torch.device("meta"):
-            test_model = WeightApproxGPT(config, freeze_every=freeze_every)
-        test_model.to_empty(device=device)
-        test_model.init_weights()
-        test_model.train()
+        # Save model state
+        was_training = model.training
+        model.train()
 
-        # Setup optimizers (allocates optimizer state memory)
-        test_optimizers = test_model.setup_optimizers(
+        # Save existing optimizers if they exist
+        existing_adamw = getattr(model, "adamw_optimizer", None)
+        existing_muon = getattr(model, "muon_optimizer", None)
+
+        # Save gate level for incremental training
+        original_gate_level = getattr(model, "prev_gate_level", 0)
+
+        # Clear any existing gradients
+        model.zero_grad(set_to_none=True)
+
+        # Setup fresh optimizers for testing
+        test_optimizers = model.setup_optimizers(
             unembedding_lr=unembedding_lr,
             embedding_lr=embedding_lr,
             matrix_lr=matrix_lr,
             weight_decay=weight_decay,
         )
 
-        # Create dummy data
+        # Create dummy data using model's vocab size from config
+        vocab_size = model.config.vocab_size
         x = torch.randint(
             0,
-            config.vocab_size,
+            vocab_size,
             (batch_size, max_seq_len),
             dtype=torch.int32,
             device=device,
         )
         y = torch.randint(
             0,
-            config.vocab_size,
+            vocab_size,
             (batch_size, max_seq_len),
             dtype=torch.int64,
             device=device,
         )
 
         # Forward pass with autocast
-        autocast_ctx = (
-            torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
-            if device_type == "cuda"
-            else nullcontext()
-        )
+        autocast_ctx = torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
+
         with autocast_ctx:
-            loss = test_model(x, y, step=0)
+            loss = model(x, y, step=0)
 
         # Backward pass (peak memory usage)
         loss.backward()
@@ -163,32 +193,75 @@ def _test_batch_size_fit(
         for opt in test_optimizers:
             opt.step()
 
-        # Successful - cleanup
-        test_model.zero_grad(set_to_none=True)
-        del test_model, test_optimizers, x, y, loss
-        if device_type == "cuda":
-            torch.cuda.empty_cache()
+        # Cleanup gradients after test
+        model.zero_grad(set_to_none=True)
+        del x, y, loss
+
+        # Restore original optimizers
+        model.adamw_optimizer = existing_adamw
+        model.muon_optimizer = existing_muon
+
+        # Restore original gate level
+        model.prev_gate_level = original_gate_level
+
+        # Restore original training state
+        if not was_training:
+            model.eval()
+
+        torch.cuda.empty_cache()
         gc.collect()
 
         return True
 
     except torch.cuda.OutOfMemoryError:
         # Expected failure - cleanup and return False
-        if device_type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+        # Restore original state even on failure
+        print0("Hit torch OOM error")
+        try:
+            model.zero_grad(set_to_none=True)
+            model.adamw_optimizer = existing_adamw
+            model.muon_optimizer = existing_muon
+            model.prev_gate_level = original_gate_level
+            if not was_training:
+                model.eval()
+        except Exception:
+            pass  # Ignore errors during cleanup
+
         return False
 
     except RuntimeError as e:
+        print0(f"RuntimeError: {e}")
         # Check if it's an OOM error on other devices
         if "out of memory" in str(e).lower():
-            gc.collect()
+            # Cleanup and return False
+            try:
+                model.zero_grad(set_to_none=True)
+                model.adamw_optimizer = existing_adamw
+                model.muon_optimizer = existing_muon
+                model.prev_gate_level = original_gate_level
+                if not was_training:
+                    model.eval()
+            except Exception as e:
+                print0(f"Failed to restore state after oom: {e}")
+                pass
             return False
-        # Unexpected error - cleanup and re-raise
-        if device_type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
+
+        # Restore state on unexpected error
+        try:
+            model.zero_grad(set_to_none=True)
+            model.adamw_optimizer = existing_adamw
+            model.muon_optimizer = existing_muon
+            model.prev_gate_level = original_gate_level
+            if not was_training:
+                model.eval()
+        except Exception as e:
+            print0(f"Failed to restore state: {e}")
+            pass
         raise e
+
+    finally:
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 def _config_to_dict(config):
@@ -205,19 +278,24 @@ def _config_to_dict(config):
 
 
 def _batch_size_key_fn(
-    config,
-    device,
-    device_type,
+    model,
     max_seq_len,
     freeze_every=None,
     embedding_lr=0.2,
     unembedding_lr=0.004,
     matrix_lr=0.02,
     weight_decay=0.0,
-    safety_factor=0.9,
+    safety_factor=0.7,
     **kwargs,
 ):
     """Generate a cache key for find_optimal_batch_size from its arguments."""
+    # Extract config and device info from model
+    config = model.config
+    device = model.get_device()
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    # For caching, we need to include enough information to ensure
+    # the same batch size will work for the same setup
     return {
         "config_class": type(config).__name__,
         "config": _config_to_dict(config),
@@ -234,9 +312,7 @@ def _batch_size_key_fn(
 
 @disk_cache(key_fn=_batch_size_key_fn, cache_name="batch_size_cache")
 def find_optimal_batch_size(
-    config,  # GPTConfig
-    device: torch.device,
-    device_type: str,
+    model: WeightApproxGPT,
     max_seq_len: int,
     max_batch_size: int = 128,
     min_batch_size: int = 1,
@@ -249,22 +325,13 @@ def find_optimal_batch_size(
     weight_decay: float = 0.0,
 ) -> int:
     """
-    Find the optimal batch size for training LayeredGPT without OOM errors.
+    Find the optimal batch size for training a WeightApproxGPT model without OOM errors.
 
     Uses binary search to find the largest batch size that fits in memory,
     testing both forward and backward passes with full optimizer state allocation.
 
-    This function mimics the actual training setup to ensure accurate results:
-    - Creates model with meta device initialization
-    - Allocates optimizer states (AdamW + Muon)
-    - Runs forward pass with autocast
-    - Runs backward pass (peak memory)
-    - Steps optimizers to allocate state
-
     Args:
-        config: GPTConfig for the model architecture
-        device: torch.device to test on (e.g., torch.device("cuda"))
-        device_type: "cuda", "cpu", or "mps"
+        model: WeightApproxGPT model to test batch size on
         max_seq_len: Sequence length to test with
         max_batch_size: Upper bound for binary search (default: 128)
         min_batch_size: Lower bound for binary search (default: 1)
@@ -280,38 +347,40 @@ def find_optimal_batch_size(
         Optimal batch size (int) with safety factor applied
 
     Example:
-        >>> config = GPTConfig(n_layer=12, n_embd=768, n_head=6, ...)
-        >>> device = torch.device("cuda")
-        >>> optimal_bs = find_optimal_batch_size(config, device, "cuda", max_seq_len=2048)
+        >>> model = WeightApproxGPT(config)
+        >>> optimal_bs = find_optimal_batch_size(model, max_seq_len=2048)
         >>> print(f"Use batch_size={optimal_bs}")
 
     Notes:
         - Only works reliably on CUDA (CPU/MPS may not have clear OOM boundaries)
         - Takes several minutes for large models (O(log n) tests)
-        - Cleans up memory between tests to avoid false OOMs
+        - Tests on the actual model state without modifying it
         - Returns min_batch_size if even that doesn't fit (check logs!)
     """
-    if device_type not in ["cuda", "cpu", "mps"]:
-        raise ValueError(
-            f"device_type must be 'cuda', 'cpu', or 'mps', got '{device_type}'"
-        )
+    # Validate model type
+    if not isinstance(model, WeightApproxGPT):
+        raise TypeError("model must be a WeightApproxGPT instance")
+
+    # Extract device and device_type from model
+    device = device_type = "cuda"
+    config = model.config
 
     if freeze_every is None:
         freeze_every = 1000000  # Large number to effectively disable
 
     if verbose:
         print0(f"\n{'=' * 60}")
-        print0(f"Finding optimal batch size for LayeredGPT")
+        print0("Finding optimal batch size for WeightApproxGPT")
         print0(f"{'=' * 60}")
         print0(
-            f"Model config: n_layer={config.n_layer}, n_embd={config.n_embd}, "
+            f"Model: n_layer={len(model.transformer.h)}, n_embd={config.n_embd}, "
             f"n_head={config.n_head}, vocab_size={config.vocab_size}"
         )
         print0(f"Sequence length: {max_seq_len}")
         print0(f"Search range: [{min_batch_size}, {max_batch_size}]")
         print0(f"Safety factor: {safety_factor:.1%}")
         print0(f"Device: {device} ({device_type})")
-        print0(f"")
+        print0("")
 
     # Binary search
     low, high = min_batch_size, max_batch_size
@@ -325,11 +394,11 @@ def find_optimal_batch_size(
         if verbose:
             print0(f"[Test {tests_run}] Trying batch_size={mid}...", end=" ")
 
+        # Test with the provided model
         success = _test_batch_size_fit(
             batch_size=mid,
-            config=config,
+            model=model,
             device=device,
-            device_type=device_type,
             max_seq_len=max_seq_len,
             freeze_every=freeze_every,
             embedding_lr=embedding_lr,
@@ -341,11 +410,11 @@ def find_optimal_batch_size(
         if success:
             best_working_batch = mid
             if verbose:
-                print0(f"SUCCESS")
+                print0("SUCCESS")
             low = mid + 1
         else:
             if verbose:
-                print0(f"OOM")
+                print0("OOM")
             high = mid - 1
 
     # Apply safety factor
@@ -353,7 +422,7 @@ def find_optimal_batch_size(
     recommended = max(1, recommended)  # Ensure at least 1
 
     if verbose:
-        print0(f"")
+        print0("")
         print0(f"{'=' * 60}")
         print0(f"Results after {tests_run} tests:")
         print0(f"  Max working batch size: {best_working_batch}")
@@ -365,6 +434,8 @@ def find_optimal_batch_size(
             print0(f"         Consider reducing model size or sequence length.")
 
         print0(f"{'=' * 60}\n")
+
+    torch.cuda.empty_cache()
 
     return recommended
 

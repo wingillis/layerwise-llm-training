@@ -519,6 +519,7 @@ class WeightApproxGPT(GPT):
             )
 
         if config.build_by_layer:
+            print("Building by layer")
             self.transformer = nn.ModuleDict(
                 # pyrefly: ignore
                 {
@@ -609,11 +610,11 @@ class WeightApproxGPT(GPT):
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:  # pyrefly: ignore
             # Handle approximated c_proj weights
-            if hasattr(block.mlp.c_proj, 'linear'):
-                if hasattr(block.mlp.c_proj.linear, 'U'):
+            if hasattr(block.mlp.c_proj, "linear"):
+                if hasattr(block.mlp.c_proj.linear, "U"):
                     # SVD approximation - zero out U
                     torch.nn.init.zeros_(block.mlp.c_proj.linear.U)
-                elif hasattr(block.mlp.c_proj.linear, 'B1'):
+                elif hasattr(block.mlp.c_proj.linear, "B1"):
                     # ABBA approximation - zero out B1 and B2
                     torch.nn.init.zeros_(block.mlp.c_proj.linear.B1)
                     torch.nn.init.zeros_(block.mlp.c_proj.linear.B2)
@@ -622,11 +623,11 @@ class WeightApproxGPT(GPT):
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
             # Handle attention c_proj
-            if hasattr(block.attn.c_proj, 'linear'):
-                if hasattr(block.attn.c_proj.linear, 'U'):
+            if hasattr(block.attn.c_proj, "linear"):
+                if hasattr(block.attn.c_proj.linear, "U"):
                     # SVD approximation - zero out U
                     torch.nn.init.zeros_(block.attn.c_proj.linear.U)
-                elif hasattr(block.attn.c_proj.linear, 'B1'):
+                elif hasattr(block.attn.c_proj.linear, "B1"):
                     # ABBA approximation - zero out B1 and B2
                     torch.nn.init.zeros_(block.attn.c_proj.linear.B1)
                     torch.nn.init.zeros_(block.attn.c_proj.linear.B2)
@@ -806,6 +807,7 @@ class WeightApproxGPT(GPT):
                 break
             x = block(x, cos_sin)
         x = norm(x)
+        print(f"x shape: {x.shape}")
 
         # Forward the lm_head (compute logits)
         softcap = 15
@@ -813,7 +815,8 @@ class WeightApproxGPT(GPT):
             # training mode: compute and return the loss
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
-            logits = logits.float()  # use tf32/fp32 for logits
+            print(f"logits shape: {logits.shape}")
+            # Keep logits in bfloat16 to save memory - cross_entropy works fine with it
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -826,6 +829,11 @@ class WeightApproxGPT(GPT):
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
             return logits
+
+    def estimate_flops(self):
+        raise NotImplementedError(
+            "estimate_flops is not implemented for ApproximatedGPT"
+        )
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

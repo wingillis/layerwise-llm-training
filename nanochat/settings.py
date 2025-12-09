@@ -42,13 +42,11 @@ class TrainSettings(BaseSettings):
     # Training horizon. Only one of these 3 will be used, in this order of precedence.
     # explicit number of steps of the optimization (-1 = disable)
     num_iterations: int = -1
-    # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
-    target_flops: float = -1.0
     # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
     target_param_data_ratio: int = 20
     # Optimization
     # per-device batch size (set to not OOM)
-    device_batch_size: int = 32
+    device_batch_size: int = 8
     # total desired batch size, in #tokens
     total_batch_size: int = 524288
     # learning rate for the embedding parameters (Adam)
