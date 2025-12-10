@@ -1,11 +1,11 @@
 # Training Configuration
 run = "dummy"
 device_type = ""
-depth = 10
+depth = 20
 max_seq_len = 2048
-num_iterations = 5075
+num_iterations = 10000
 target_param_data_ratio = 20
-device_batch_size = 4
+device_batch_size = 8
 total_batch_size = 524288
 embedding_lr = 0.2
 unembedding_lr = 0.004
@@ -23,3 +23,7 @@ core_metric_max_per_task = 500
 sample_every = 2000
 save_every = -1
 model_tag = ""
+approx_lm_head = true
+lm_head_rank = 128
+freeze_previous_weights = false
+mlp_proj_rank = 32

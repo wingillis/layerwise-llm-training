@@ -55,9 +55,11 @@ autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 def parse_settings(settings: TrainSettings):
     """Parse CLI arguments and load/create settings."""
-    updated_params = (
-        TrainSettings().load_or_create().model_copy(update=settings.model_dump())
+    diff = set(settings.model_dump().items()) - set(
+        TrainSettings().model_dump().items()
     )
+    print0(f"Different settings from default: {diff}")
+    updated_params = TrainSettings().load_or_create().model_copy(update=dict(diff))
 
     return updated_params
 
@@ -149,6 +151,8 @@ def compute_model_config(
         approx_type=settings.approx_type,
         approx_mlp_proj=settings.approx_mlp_proj,
         mlp_proj_rank=settings.mlp_proj_rank,
+        approx_lm_head=settings.approx_lm_head,
+        lm_head_rank=settings.lm_head_rank,
         build_by_layer=settings.build_by_layer,
         copy_block_weights=settings.copy_block_weights,
         freeze_previous_weights=settings.freeze_previous_weights,
@@ -161,24 +165,21 @@ def compute_model_config(
 
 
 def create_model(
-    settings,
     model_config,
     device,
     checkpoint_dir,
     resume_from_step,
     ddp_rank,
-    num_iterations,
 ):
     """Create model on meta device, move to device, init weights, and handle checkpoint loading.
 
     Returns:
         tuple: (model, orig_model, model_config, optimizer_data, meta_data, num_params)
     """
-    freeze_every = num_iterations // settings.depth
     with torch.device("meta"):
         model = WeightApproxGPT(
             model_config,
-            freeze_every=freeze_every,
+            freeze_every=None,
         )
     model.to_empty(device=device)
     model.init_weights()
@@ -198,6 +199,7 @@ def create_model(
     orig_model = model
     num_params = sum(p.numel() for p in model.parameters())
     print0(f"Number of parameters: {num_params:,}")
+    model = torch.compile(model, dynamic=True)
 
     return (
         model,
@@ -334,14 +336,15 @@ def evaluate_validation_bpb(
     Returns:
         tuple: (val_bpb, should_log)
     """
-    model.eval()
-    val_loader = build_val_loader()
-    eval_steps = settings.eval_tokens // (
-        eval_batch_size * settings.max_seq_len * ddp_world_size
-    )
-    with autocast_ctx:
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, step)
-    print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+    with torch.no_grad():
+        model.eval()
+        val_loader = build_val_loader()
+        eval_steps = settings.eval_tokens // (
+            eval_batch_size * settings.max_seq_len * ddp_world_size
+        )
+        with autocast_ctx:
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, step)
+        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
     model.train()
     return val_bpb
 
@@ -398,7 +401,7 @@ def train_loop(
         last_step = step == num_iterations
 
         # Evaluate validation bpb
-        if last_step or step % settings.eval_every == 0:
+        if last_step or step % settings.eval_every == 0 and step > 0:
             val_bpb = evaluate_validation_bpb(
                 model,
                 build_val_loader,
@@ -629,6 +632,7 @@ def main(settings: TrainSettings):
     # Parse settings
     settings = parse_settings(settings)
     user_config = settings
+    print0(settings)
 
     # Extract commonly used settings
     num_iterations = settings.num_iterations
@@ -676,13 +680,11 @@ def main(settings: TrainSettings):
         meta_data,
         num_params,
     ) = create_model(
-        settings,
         model_config,
         device,
         checkpoint_dir,
         resume_from_step,
         ddp_rank,
-        num_iterations,
     )
     print("N layers at training start: ", len(model.transformer.h))
     n_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -693,6 +695,10 @@ def main(settings: TrainSettings):
     num_iterations, total_tokens = compute_training_iterations(
         settings, num_params, total_batch_size, num_iterations
     )
+    print0(f"Updating num_iterations to {num_iterations} in settings")
+    settings = settings.model_copy(update={"num_iterations": num_iterations})
+    # explicitly set here after we compute num_iterations
+    model.freeze_every = num_iterations // settings.depth
 
     # Setup optimizers
     optimizers = setup_optimizers(model, settings, optimizer_data)
@@ -701,7 +707,6 @@ def main(settings: TrainSettings):
     (train_loader, build_val_loader, x, y, dataloader_state_dict) = setup_dataloaders(
         device, meta_data, device_batch_size, settings.max_seq_len
     )
-    print0(f"x shape: {x.shape}; y shape: {y.shape}")
 
     # Setup LR scheduler
     get_lr_multiplier = setup_lr_scheduler(settings, num_iterations)
@@ -711,6 +716,7 @@ def main(settings: TrainSettings):
 
     # Calculate freeze_every for train loop
     freeze_every = num_iterations // settings.depth
+    print0(freeze_every)
 
     # Run training loop
     train_results = train_loop(

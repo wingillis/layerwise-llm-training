@@ -15,6 +15,7 @@ from functools import partial
 from dataclasses import dataclass
 from typing import Literal
 from einops import einsum, rearrange
+import math
 
 import torch
 import torch.nn as nn
@@ -40,6 +41,8 @@ class WeightApproxGPTConfig:
     )
     approx_mlp_proj: bool = True  # Whether to use low-rank MLP weights approximation
     mlp_proj_rank: int = 16  # Rank for low-rank MLP weights approximation
+    approx_lm_head: bool = False  # Whether to use low-rank approximation for lm_head
+    lm_head_rank: int = 16  # Rank for low-rank lm_head approximation
     # Layer-wise training settings
     build_by_layer: bool = True  # Whether to build model layer-by-layer incrementally
     copy_block_weights: bool = (
@@ -503,12 +506,11 @@ class ApproxWeightBlock(nn.Module):
 
 
 class WeightApproxGPT(GPT):
-    def __init__(self, config: WeightApproxGPTConfig, freeze_every: int):
+    def __init__(self, config: WeightApproxGPTConfig, freeze_every: int | None = None):
         nn.Module.__init__(self)
         self.config = config
 
         # Create shared Linformer projection for layerwise sharing
-        self.shared_linformer_proj = None
         if config.use_linformer and config.linformer_sharing == "layerwise":
             share_kv = False  # layerwise uses separate E and F
             self.shared_linformer_proj = LinformerProjection(
@@ -517,50 +519,39 @@ class WeightApproxGPT(GPT):
                 n_kv_head=1,  # Single projection shared across all heads and layers
                 share_kv=share_kv,
             )
+        else:
+            self.shared_linformer_proj = None
+
+        blocks = [
+            ApproxWeightBlock(
+                config, layer_idx=i, shared_linformer_proj=self.shared_linformer_proj
+            )
+            for i in range(config.n_layer)
+        ]
 
         if config.build_by_layer:
             print("Building by layer")
-            self.transformer = nn.ModuleDict(
-                # pyrefly: ignore
-                {
-                    "wte": torch.compile(
-                        nn.Embedding(config.vocab_size, config.n_embd), dynamic=False
-                    ),
-                    "h": nn.ModuleList(
-                        [  # pyrefly: ignore
-                            torch.compile(
-                                ApproxWeightBlock(
-                                    config,
-                                    layer_idx=0,
-                                    shared_linformer_proj=self.shared_linformer_proj,
-                                ),
-                                dynamic=False,
-                            )
-                        ]
-                    ),
-                }
+            for b in blocks[1:]:
+                # freeze weights
+                for param in b.parameters():
+                    param.requires_grad = False
+
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "h": nn.ModuleList(blocks),
+            }
+        )
+        if config.approx_lm_head:
+            self.lm_head = ApproxLinear(
+                config.n_embd,
+                config.vocab_size,
+                config.approx_type,
+                config.lm_head_rank,
+                bias=False,
             )
         else:
-            self.transformer = nn.ModuleDict(
-                {
-                    "wte": nn.Embedding(config.vocab_size, config.n_embd),
-                    "h": nn.ModuleList(
-                        [
-                            ApproxWeightBlock(
-                                config,
-                                layer_idx=layer_idx,
-                                shared_linformer_proj=self.shared_linformer_proj,
-                            )
-                            for layer_idx in range(config.n_layer)
-                        ]
-                    ),
-                }
-            )
-            # pyrefly: ignore
-            self.transformer = torch.compile(self.transformer, dynamic=False)
-        self.lm_head = torch.compile(
-            nn.Linear(config.n_embd, config.vocab_size, bias=False), dynamic=False
-        )
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # To support meta device initialization, we init the rotary embeddings here, but it's fake
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -582,14 +573,11 @@ class WeightApproxGPT(GPT):
         self.muon_optimizer = None
 
     def add_block(self, layer_idx):
-        block = ApproxWeightBlock(
-            self.config, layer_idx, shared_linformer_proj=self.shared_linformer_proj
-        )
         if self.config.copy_block_weights:
             # Only copy non-linformer weights when using shared projection
-            prev_state = self.transformer.h[
-                layer_idx - 1
-            ].state_dict()  # pyrefly: ignore
+            print0(f"Copying block weights from {layer_idx - 1} to {layer_idx}")
+            # pyrefly: ignore
+            prev_state = self.transformer.h[layer_idx - 1].state_dict()
             if (
                 self.config.use_linformer
                 and self.config.linformer_sharing == "layerwise"
@@ -598,16 +586,78 @@ class WeightApproxGPT(GPT):
                 prev_state = {
                     k: v for k, v in prev_state.items() if "linformer_proj" not in k
                 }
-            block.load_state_dict(prev_state, strict=False)
+            # pyrefly: ignore
+            self.transformer.h[layer_idx].load_state_dict(prev_state, strict=False)
         # pyrefly: ignore
-        self.transformer.h.append(torch.compile(block, dynamic=False))
-        self.config.n_layer += 1
+        for p in self.transformer.h[layer_idx].parameters():
+            p.requires_grad = True
+
+    @torch.no_grad()
+    def _init_approx_linear_weights(self):
+        """Initialize ApproxLinear parameters with dimension-aware scaling.
+
+        Uses Kaiming/He-style initialization adapted for low-rank structures
+        to maintain proper variance through the approximation layers.
+
+        When model is created on meta device and moved with to_empty(),
+        nn.Parameter values are lost. _init_weights only handles nn.Linear
+        and nn.Embedding, so we need to explicitly initialize ApproxLinear params.
+        """
+        for module in self.modules():
+            if isinstance(module, ApproxLinearSVD):
+                # SVD: W = U @ V.T, need to maintain variance of effective weight
+                fan_in = module.in_features
+                rank = module.rank
+
+                # Scale for maintaining variance in W = U @ V.T
+                # std(W) ≈ std(U) * std(V) * sqrt(rank)
+                scale = 1.0 / (math.sqrt(fan_in) / math.sqrt(rank))
+
+                # Kaiming initialization followed by scaling (with no_grad)
+                torch.nn.init.kaiming_normal_(
+                    module.U, a=0, mode="fan_in", nonlinearity="linear"
+                )
+                torch.nn.init.kaiming_normal_(
+                    module.V, a=0, mode="fan_in", nonlinearity="linear"
+                )
+
+                # Apply scale to maintain proper variance
+                module.U *= scale
+                module.V *= scale
+
+            elif isinstance(module, ApproxLinearABBA):
+                # ABBA: W = B_kr @ A_kr where B_kr and A_kr involve Khatri-Rao products
+                # The Khatri-Rao product effectively squares the rank dimension
+                # Note: ABBA splits the rank by 2 in its __init__
+                fan_in = module.in_features
+                actual_rank = module.rank  # This is already rank//2 due to ABBA init
+
+                # Scale accounting for the two-stage computation
+                # ABBA computes x @ A_kr @ B_kr where A_kr and B_kr are rank^2 in size
+                # We need to scale by sqrt(fan_in) and also account for the rank expansion
+                scale = 1.0 / (math.sqrt(fan_in) / math.sqrt(actual_rank))
+
+                # Initialize all four matrices (with no_grad)
+                for param in [module.A1, module.A2, module.B1, module.B2]:
+                    torch.nn.init.kaiming_normal_(
+                        param, a=0, mode="fan_in", nonlinearity="linear"
+                    )
+                    param *= scale
 
     def init_weights(self):
         self.apply(self._init_weights)
-        # zero out classifier weights
-        torch.nn.init.zeros_(self.lm_head.weight)
-        # zero out c_proj weights in all blocks
+
+        # Initialize ApproxLinear parameters (not handled by _init_weights)
+        self._init_approx_linear_weights()
+
+        # zero out classifier weights (only for non-ApproxLinear lm_head)
+        if not hasattr(self.lm_head, "linear"):
+            # Standard linear layer - zero it out
+            torch.nn.init.zeros_(self.lm_head.weight)
+        # Note: ApproxLinear lm_head keeps its random initialization
+        # to provide gradient signal. Zeroing would cause zero output and vanishing gradients.
+
+        # zero out c_proj weights in all blocks (AFTER _init_approx_linear_weights)
         for block in self.transformer.h:  # pyrefly: ignore
             # Handle approximated c_proj weights
             if hasattr(block.mlp.c_proj, "linear"):
@@ -683,95 +733,32 @@ class WeightApproxGPT(GPT):
         self.muon_optimizer = muon_optimizer
         return optimizers
 
-    def _add_block_to_optimizer(self, block):
-        """Add new block's parameters to the Muon optimizer.
-
-        Handles both Muon (groups by numel) and DistMuon (groups by shape).
-        """
-        if self.muon_optimizer is None:
-            return  # Optimizers not set up yet
-
-        ddp, rank, local_rank, world_size = get_dist_info()
-        is_dist_muon = ddp
-
-        # Get all parameters from the new block
-        new_params = list(block.parameters())
-
-        # Group parameters by shape (DistMuon) or numel (Muon)
-        def key_fn(p):
-            return p.shape if is_dist_muon else p.numel()
-
-        new_params_by_key = {}
-        for p in new_params:
-            key = key_fn(p)
-            if key not in new_params_by_key:
-                new_params_by_key[key] = []
-            new_params_by_key[key].append(p)
-
-        # Add to existing param_group or create new one
-        for key, params in new_params_by_key.items():
-            added_to_existing = False
-
-            # Try to find existing group with matching key
-            for group in self.muon_optimizer.param_groups:
-                if len(group["params"]) == 0:
-                    continue
-
-                existing_param = group["params"][0]
-                group_key = key_fn(existing_param)
-
-                if group_key == key:
-                    # Add to existing group
-                    group["params"].extend(params)
-                    added_to_existing = True
-                    if rank == 0:
-                        print0(
-                            f"Added {len(params)} params to existing Muon group (key={key})"
-                        )
-                    break
-
-            # Create new group if no match found
-            if not added_to_existing:
-                new_group = {"params": params}
-                if is_dist_muon and len(params) > 0:
-                    new_group["zero_buffer"] = torch.zeros_like(params[0])
-
-                self.muon_optimizer.add_param_group(new_group)
-                if rank == 0:
-                    print0(
-                        f"Created new Muon param group with {len(params)} params (key={key})"
-                    )
-
     def check_gate_level(self, gate_level):
         # New implementation: only support forward direction by adding blocks
+        if gate_level != self.prev_gate_level:
+            print0(f"Gate level changed from {self.prev_gate_level} to {gate_level}")
         if (
             gate_level != self.prev_gate_level
             and self.training
             and gate_level > self.prev_gate_level  # Only forward direction
         ):
             # Add blocks for each new gate level needed
-            layer_idx = len(self.transformer.h)  # pyrefly: ignore
-            self.add_block(layer_idx)
-            print0(f"Added new block at layer {layer_idx}")
+            self.add_block(gate_level)
+            print0(f"Added new block at gate level {gate_level}")
 
             self.prev_gate_level = gate_level
             print0(f"New gate level: {gate_level}")
 
             if self.config.freeze_previous_weights:
                 # Freeze all PREVIOUS blocks (not the newly added one)
-                for i in range(layer_idx):
+                for i in range(gate_level):
                     for param in self.transformer.h[i].parameters():  # pyrefly: ignore
                         param.requires_grad = False
 
                 # Also freeze embeddings on first block addition
-                if layer_idx == 1:  # Just added second block
+                if gate_level == 1:  # Just added second block
                     for param in self.transformer.wte.parameters():  # pyrefly: ignore
                         param.requires_grad = False
-
-            # Register the NEW block's parameters with optimizer
-            # (always do this since the new block is trainable)
-            new_block = self.transformer.h[layer_idx]  # pyrefly: ignore
-            self._add_block_to_optimizer(new_block)
 
         return gate_level
 
@@ -792,22 +779,17 @@ class WeightApproxGPT(GPT):
         )  # truncate to current sequence length
 
         # Forward the trunk of the Transformer
-        x = self.transformer.wte(idx)
+        x = self.transformer.wte(idx)  # pyrefly: ignore
         x = norm(x)
         gate_level = step // self.freeze_every if step is not None else 0
-        # Remove reverse training order logic since we only support forward direction
-        # if self.reverse_train_order and gate_level is not None:
-        #     gate_level = max(len(self.transformer.h) - gate_level - 1, 0)
 
         self.check_gate_level(gate_level)
 
-        for i, block in enumerate(self.transformer.h):  # pyrefly: ignore
-            # Only support forward direction - process blocks up to gate_level
-            if i > gate_level:
-                break
+        for block in self.transformer.h[:gate_level + 1]:  # pyrefly: ignore
+            # pyrefly: ignore
             x = block(x, cos_sin)
+
         x = norm(x)
-        print(f"x shape: {x.shape}")
 
         # Forward the lm_head (compute logits)
         softcap = 15
@@ -815,7 +797,6 @@ class WeightApproxGPT(GPT):
             # training mode: compute and return the loss
             logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
-            print(f"logits shape: {logits.shape}")
             # Keep logits in bfloat16 to save memory - cross_entropy works fine with it
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),

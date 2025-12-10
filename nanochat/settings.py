@@ -27,6 +27,10 @@ class TrainSettings(BaseSettings):
     approx_mlp_proj: bool = True
     # Rank for low-rank MLP weights approximation
     mlp_proj_rank: int = 16
+    # Whether to use low-rank approximation for lm_head (unembedding)
+    approx_lm_head: bool = False
+    # Rank for low-rank lm_head approximation
+    lm_head_rank: int = 16
     # Whether to build model layer-by-layer incrementally
     build_by_layer: bool = True
     # Whether new blocks copy weights from previous layer
@@ -109,4 +113,4 @@ class TrainSettings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         if self.device_type == "":
-            self.device_type = autodetect_device_type()
+            self.device_type = "cuda"
