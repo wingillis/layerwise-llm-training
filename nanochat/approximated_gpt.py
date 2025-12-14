@@ -498,15 +498,8 @@ class ApproxWeightBlock(nn.Module):
 
     def forward(self, x, cos_sin):
         attn_output = self.attn(norm(x), cos_sin)
-        # compute the norm of the attn_output
-        with torch.no_grad():
-            attn_output_norm = attn_output.norm().item()
-            print0(f"Attn output norm: {attn_output_norm}")
         x = x + attn_output
         mlp_output = self.mlp(norm(x))
-        with torch.no_grad():
-            mlp_output_norm = mlp_output.norm().item()
-            print0(f"MLP output norm: {mlp_output_norm}")
         x = x + mlp_output
         return x
 
@@ -536,7 +529,7 @@ class WeightApproxGPT(GPT):
         ]
 
         if config.build_by_layer:
-            print("Building by layer")
+            print0("Building by layer")
             for b in blocks[1:]:
                 # freeze weights
                 for param in b.parameters():
@@ -791,15 +784,18 @@ class WeightApproxGPT(GPT):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)  # pyrefly: ignore
         x = norm(x)
-        gate_level = step // self.freeze_every if step is not None else 0
 
-        self.check_gate_level(gate_level)
-
-        for i, block in enumerate(
+        if self.config.build_by_layer:
+            # Use only blocks up to gate_level
+            gate_level = step // self.freeze_every if step is not None else 0
+            self.check_gate_level(gate_level)
             # pyrefly: ignore
-            self.transformer.h[: gate_level + 1]
-        ):
-            print0(f"In block {i}")
+            blocks_to_use = self.transformer.h[: gate_level + 1]
+        else:
+            # Use all blocks regardless of gate_level
+            blocks_to_use = self.transformer.h
+
+        for block in blocks_to_use:  # pyrefly: ignore
             x = block(x, cos_sin)  # pyrefly: ignore
 
         x = norm(x)
