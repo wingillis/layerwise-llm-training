@@ -419,7 +419,6 @@ def test_build_by_layer_shapes():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=True,  # This is the failing config
-        copy_block_weights=True,
         freeze_previous_weights=False,
         use_linformer=False,
     )
@@ -528,7 +527,6 @@ def test_training_loop_shapes():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=True,
-        copy_block_weights=True,
         freeze_previous_weights=False,
         use_linformer=False,
     )
@@ -634,7 +632,6 @@ def test_exact_user_config():
         approx_mlp_proj=True,
         mlp_proj_rank=16,
         build_by_layer=True,
-        copy_block_weights=True,
         freeze_previous_weights=True,  # User has this True
         use_linformer=False,
     )

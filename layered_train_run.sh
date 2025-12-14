@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# set -e
+set -e
 
 source .env
 
@@ -25,6 +25,7 @@ fi
 # wait $DATASET_DOWNLOAD_PID
 
 # pretrain the d20 model
+# uv run python -m scripts.base_train --run=base --depth=20 --device_batch_size=4 --num_iterations=10000
 uv run python -m scripts.base_efficient_train --depth 20 --approx-type=svd --run=test-svd 
-uv run python -m scripts.base_train --run=base --depth=20 --device_batch_size=4 --num_iterations=10000
-uv run python -m scripts.base_efficient_train --depth 20 --approx-type=abba --run=test-abba 
+# NOTE: there's something wrong with abba initialization.
+# uv run python -m scripts.base_efficient_train --depth 20 --approx-type=abba --run=test-abba 

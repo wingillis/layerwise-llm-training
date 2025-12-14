@@ -45,9 +45,6 @@ class WeightApproxGPTConfig:
     lm_head_rank: int = 16  # Rank for low-rank lm_head approximation
     # Layer-wise training settings
     build_by_layer: bool = True  # Whether to build model layer-by-layer incrementally
-    copy_block_weights: bool = (
-        True  # Whether new blocks copy weights from previous layer
-    )
     freeze_previous_weights: bool = (
         False  # Whether to freeze previous blocks during training
     )
@@ -500,8 +497,17 @@ class ApproxWeightBlock(nn.Module):
             self.mlp: nn.Module = MLP(config)
 
     def forward(self, x, cos_sin):
-        x = x + self.attn(norm(x), cos_sin)
-        x = x + self.mlp(norm(x))
+        attn_output = self.attn(norm(x), cos_sin)
+        # compute the norm of the attn_output
+        with torch.no_grad():
+            attn_output_norm = attn_output.norm().item()
+            print0(f"Attn output norm: {attn_output_norm}")
+        x = x + attn_output
+        mlp_output = self.mlp(norm(x))
+        with torch.no_grad():
+            mlp_output_norm = mlp_output.norm().item()
+            print0(f"MLP output norm: {mlp_output_norm}")
+        x = x + mlp_output
         return x
 
 
@@ -573,21 +579,6 @@ class WeightApproxGPT(GPT):
         self.muon_optimizer = None
 
     def add_block(self, layer_idx):
-        if self.config.copy_block_weights:
-            # Only copy non-linformer weights when using shared projection
-            print0(f"Copying block weights from {layer_idx - 1} to {layer_idx}")
-            # pyrefly: ignore
-            prev_state = self.transformer.h[layer_idx - 1].state_dict()
-            if (
-                self.config.use_linformer
-                and self.config.linformer_sharing == "layerwise"
-            ):
-                # Filter out linformer_proj parameters (they're shared, not copied)
-                prev_state = {
-                    k: v for k, v in prev_state.items() if "linformer_proj" not in k
-                }
-            # pyrefly: ignore
-            self.transformer.h[layer_idx].load_state_dict(prev_state, strict=False)
         # pyrefly: ignore
         for p in self.transformer.h[layer_idx].parameters():
             p.requires_grad = True
@@ -653,12 +644,13 @@ class WeightApproxGPT(GPT):
         # zero out classifier weights (only for non-ApproxLinear lm_head)
         if not hasattr(self.lm_head, "linear"):
             # Standard linear layer - zero it out
-            torch.nn.init.zeros_(self.lm_head.weight)
+            torch.nn.init.zeros_(self.lm_head.weight)  # pyrefly: ignore
         # Note: ApproxLinear lm_head keeps its random initialization
         # to provide gradient signal. Zeroing would cause zero output and vanishing gradients.
 
-        # zero out c_proj weights in all blocks (AFTER _init_approx_linear_weights)
-        for block in self.transformer.h:  # pyrefly: ignore
+        # zero out c_proj weights in all blocks following the first (AFTER _init_approx_linear_weights)
+        for block_num, block in enumerate(self.transformer.h[1:], start=1):  # pyrefly: ignore
+            print0(f"In block {block_num}")
             # Handle approximated c_proj weights
             if hasattr(block.mlp.c_proj, "linear"):
                 if hasattr(block.mlp.c_proj.linear, "U"):
@@ -667,30 +659,48 @@ class WeightApproxGPT(GPT):
                 elif hasattr(block.mlp.c_proj.linear, "B1"):
                     # ABBA approximation - zero out B1 and B2
                     torch.nn.init.zeros_(block.mlp.c_proj.linear.B1)
-                    torch.nn.init.zeros_(block.mlp.c_proj.linear.B2)
+                    # torch.nn.init.zeros_(block.mlp.c_proj.linear.B2)
             else:
                 # Standard linear layer
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            # assert that the output of the block produces 0
+            with torch.no_grad():
+                random_input = torch.randn(1, 1, self.config.n_embd, device="cuda")
+                output = block.mlp(random_input)
+                assert torch.allclose(output, torch.zeros_like(output)), f"Block {block_num} does not produce 0 for mlp"
 
             # Handle attention c_proj
             if hasattr(block.attn.c_proj, "linear"):
                 if hasattr(block.attn.c_proj.linear, "U"):
                     # SVD approximation - zero out U
                     torch.nn.init.zeros_(block.attn.c_proj.linear.U)
+                    # torch.nn.init.zeros_(block.attn.c_proj.linear.V)
                 elif hasattr(block.attn.c_proj.linear, "B1"):
                     # ABBA approximation - zero out B1 and B2
                     torch.nn.init.zeros_(block.attn.c_proj.linear.B1)
                     torch.nn.init.zeros_(block.attn.c_proj.linear.B2)
+                    # torch.nn.init.zeros_(block.attn.c_proj.linear.A1)
+                    # torch.nn.init.zeros_(block.attn.c_proj.linear.A2)
             else:
                 # Standard linear layer
+                print0("Zeroing out attn.c_proj.weight")
                 torch.nn.init.zeros_(block.attn.c_proj.weight)
+                # if has bias, zero it out as well
+                if block.attn.c_proj.bias is not None:
+                    print0("Zeroing out attn.c_proj.bias")
+                    torch.nn.init.zeros_(block.attn.c_proj.bias)
+
+            with torch.no_grad():
+                random_input = torch.randn(1, 1, self.config.n_embd, device="cuda")
+                output = block.attn.c_proj(random_input)
+                assert torch.allclose(output, torch.zeros_like(output)), f"Block {block_num} does not produce 0 for attn.c_proj"
 
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        if self.transformer.wte.weight.device.type == "cuda":
+        if self.transformer.wte.weight.device.type == "cuda":  # pyrefly: ignore
             self.transformer.wte.to(dtype=torch.bfloat16)
 
     def setup_optimizers(
@@ -785,9 +795,12 @@ class WeightApproxGPT(GPT):
 
         self.check_gate_level(gate_level)
 
-        for block in self.transformer.h[:gate_level + 1]:  # pyrefly: ignore
+        for i, block in enumerate(
             # pyrefly: ignore
-            x = block(x, cos_sin)
+            self.transformer.h[: gate_level + 1]
+        ):
+            print0(f"In block {i}")
+            x = block(x, cos_sin)  # pyrefly: ignore
 
         x = norm(x)
 

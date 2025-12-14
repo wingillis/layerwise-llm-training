@@ -46,6 +46,8 @@ from nanochat.utils import (
 )
 from nanochat.engine import Engine
 from nanochat.settings import TrainSettings
+from nanochat.gradient_monitor import GradientMonitor
+from nanochat.weight_monitor import WeightMonitor
 from scripts.base_eval import evaluate_model
 
 
@@ -154,7 +156,6 @@ def compute_model_config(
         approx_lm_head=settings.approx_lm_head,
         lm_head_rank=settings.lm_head_rank,
         build_by_layer=settings.build_by_layer,
-        copy_block_weights=settings.copy_block_weights,
         freeze_previous_weights=settings.freeze_previous_weights,
         use_linformer=settings.use_linformer,
         linformer_proj_dim=settings.linformer_proj_dim,
@@ -238,7 +239,7 @@ def compute_training_iterations(settings, num_params, total_batch_size, num_iter
     return (num_iterations, total_tokens)
 
 
-def setup_optimizers(model, settings, optimizer_data):
+def setup_optimizers(model, settings):
     """Create optimizers and load state if resuming.
 
     Returns:
@@ -250,12 +251,6 @@ def setup_optimizers(model, settings, optimizer_data):
         matrix_lr=settings.matrix_lr,
         weight_decay=settings.weight_decay,
     )
-    adamw_optimizer, muon_optimizer = optimizers
-
-    if optimizer_data is not None:
-        for opt, dat in zip(optimizers, optimizer_data):
-            opt.load_state_dict(dat)
-        del optimizer_data
 
     return optimizers
 
@@ -396,6 +391,10 @@ def train_loop(
     val_bpb = float("inf")
     results = {}
 
+    # Initialize gradient and weight monitors
+    gradient_monitor = GradientMonitor(orig_model)
+    weight_monitor = WeightMonitor(orig_model, log_frequency=settings.log_weights_every)
+
     pbar = tqdm(range(num_iterations), desc="training")
     for mstep in pbar:  # pyrefly: ignore
         last_step = step == num_iterations
@@ -511,6 +510,14 @@ def train_loop(
             loss.backward()
             x, y, dataloader_state_dict = next(train_loader)
 
+        # Collect per-layer gradients after backward pass
+        layer_grad_data = {}
+        if step % settings.log_gradients_every == 0:
+            layer_grad_data = gradient_monitor.collect_grad_norms(step)
+
+        # Collect per-layer weight statistics
+        layer_weight_data = weight_monitor.collect_weight_stats(step)
+
         # Gradient clipping
         grad_clip_enabled = settings.grad_clip > 0.0
         if grad_clip_enabled:
@@ -548,7 +555,8 @@ def train_loop(
         pf = {"loss": debiased_smooth_loss, "tok_per_sec": round(tok_per_sec)}
         if grad_clip_enabled:
             pf["grad_norm"] = round(grad_norm, 2)
-        pbar.set_postfix(pf)
+
+        pbar.set_postfix(pf)  # pyrefly: ignore
 
         if step % 10 == 0:
             log_data = {
@@ -562,10 +570,17 @@ def train_loop(
             }
             if grad_clip_enabled:
                 log_data["train/grad_norm"] = grad_norm
+            # Add per-layer gradient data if collected
+            if layer_grad_data:
+                log_data.update(layer_grad_data)
+            # Add per-layer weight data if collected
+            if layer_weight_data:
+                log_data.update(layer_weight_data)
             wandb_run.log(log_data)
 
         step += 1
-    pbar.close()
+
+    pbar.close()  # pyrefly: ignore
 
     return {
         "min_val_bpb": min_val_bpb,
@@ -686,7 +701,6 @@ def main(settings: TrainSettings):
         resume_from_step,
         ddp_rank,
     )
-    print("N layers at training start: ", len(model.transformer.h))
     n_params = sum(p.numel() for p in model.transformer.h.parameters())
     print0(f"N params in transformer: {n_params:,}")
     print0(f"N params: {num_params:,}")
@@ -701,7 +715,7 @@ def main(settings: TrainSettings):
     model.freeze_every = num_iterations // settings.depth
 
     # Setup optimizers
-    optimizers = setup_optimizers(model, settings, optimizer_data)
+    optimizers = setup_optimizers(model, settings)
 
     # Setup dataloaders
     (train_loader, build_val_loader, x, y, dataloader_state_dict) = setup_dataloaders(
@@ -716,7 +730,7 @@ def main(settings: TrainSettings):
 
     # Calculate freeze_every for train loop
     freeze_every = num_iterations // settings.depth
-    print0(freeze_every)
+    print0(f"Adding layer every {freeze_every} iterations")
 
     # Run training loop
     train_results = train_loop(

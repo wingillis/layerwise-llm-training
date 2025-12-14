@@ -33,8 +33,6 @@ class TrainSettings(BaseSettings):
     lm_head_rank: int = 16
     # Whether to build model layer-by-layer incrementally
     build_by_layer: bool = True
-    # Whether new blocks copy weights from previous layer
-    copy_block_weights: bool = True
     # Whether to freeze previous blocks during training
     freeze_previous_weights: bool = True
     # Whether to use Linformer attention
@@ -63,6 +61,10 @@ class TrainSettings(BaseSettings):
     matrix_lr: float = 0.02
     # gradient clipping value (0.0 = disabled)
     grad_clip: float = 1.0
+    # log per-layer gradients every N steps
+    log_gradients_every: int = 10
+    # log per-layer weights every N steps
+    log_weights_every: int = 10
     # ratio of iterations for LR warmup
     warmup_ratio: float = 0.0
     # ratio of iterations for LR warmdown
