@@ -21,7 +21,6 @@ def test_materialization_preserves_behavior():
         approx_type="abba",
         approx_mlp_proj=True,
         mlp_proj_rank=8,
-        use_linformer=False,
         build_by_layer=False,
     )
 

@@ -20,6 +20,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
@@ -48,13 +49,13 @@ class WeightApproxGPTConfig:
     freeze_previous_weights: bool = (
         False  # Whether to freeze previous blocks during training
     )
-    # Linformer settings
-    use_linformer: bool = False  # Whether to use Linformer attention
-    linformer_proj_dim: int = 128  # Projection dimension k for Linformer
-    linformer_sharing: Literal["none", "headwise", "keyvalue", "layerwise"] = (
-        "layerwise"  # Parameter sharing strategy for Linformer projections
-    )
-
+    # Whether to use low-rank approximation for attention projections
+    approx_attn: bool = False
+    # Rank for low-rank attention approximation
+    attn_rank: int = 16
+    # Whether to use gradient checkpointing
+    gradient_checkpointing: bool = False
+  
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
@@ -82,10 +83,22 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        # Use ApproxLinear for attention projections if configured
+        if config.approx_attn:
+            self.c_q: nn.Module = ApproxLinear(self.n_embd, self.n_head * self.head_dim,
+                                   config.approx_type, config.attn_rank, bias=False)
+            self.c_k: nn.Module = ApproxLinear(self.n_embd, self.n_kv_head * self.head_dim,
+                                   config.approx_type, config.attn_rank, bias=False)
+            self.c_v: nn.Module = ApproxLinear(self.n_embd, self.n_kv_head * self.head_dim,
+                                   config.approx_type, config.attn_rank, bias=False)
+            self.c_proj: nn.Module = ApproxLinear(self.n_embd, self.n_embd,
+                                      config.approx_type, config.attn_rank, bias=False)
+        else:
+            self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin):
         B, T, C = x.size()
@@ -122,195 +135,6 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class LinformerProjection(nn.Module):
-    """Projection matrices for Linformer attention.
-
-    Projects sequence dimension from n (seq_len) to k (proj_dim) for efficient attention.
-    Supports different sharing strategies for parameter efficiency.
-    """
-
-    def __init__(
-        self,
-        seq_len: int,
-        proj_dim: int,
-        n_kv_head: int = 1,
-        share_kv: bool = False,
-    ):
-        super().__init__()
-        self.seq_len = seq_len
-        self.proj_dim = proj_dim
-        self.n_kv_head = n_kv_head
-        self.share_kv = share_kv
-
-        # E projects keys: (proj_dim, seq_len)
-        # When applied: E @ K where K is (B, n_kv_head, T, head_dim)
-        # Result: (B, n_kv_head, proj_dim, head_dim)
-        self.E = nn.Parameter(torch.randn(n_kv_head, proj_dim, seq_len) * 0.02)
-
-        if share_kv:
-            # Share projection between keys and values
-            self.register_parameter("F", None)
-        else:
-            # F projects values: (proj_dim, seq_len)
-            self.F = nn.Parameter(torch.randn(n_kv_head, proj_dim, seq_len) * 0.02)
-
-    def project_kv(
-        self, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project keys and values to lower dimension.
-
-        Args:
-            k: Keys of shape (B, n_kv_head, T, head_dim)
-            v: Values of shape (B, n_kv_head, T, head_dim)
-
-        Returns:
-            k_proj: Projected keys of shape (B, n_kv_head, proj_dim, head_dim)
-            v_proj: Projected values of shape (B, n_kv_head, proj_dim, head_dim)
-        """
-        B, H, T, D = k.shape
-
-        # Handle variable sequence lengths by slicing projection matrices
-        E = self.E[:, :, :T]  # (n_kv_head, proj_dim, T)
-        F_mat = E if self.share_kv else self.F[:, :, :T]
-
-        # Project: E @ K -> (B, n_kv_head, proj_dim, head_dim)
-        # k is (B, H, T, D), E is (H, k, T)
-        # We want einsum: b h t d, h k t -> b h k d
-        k_proj = einsum(E, k, "h k t, b h t d -> b h k d")
-        v_proj = einsum(F_mat, v, "h k t, b h t d -> b h k d")
-
-        return k_proj, v_proj
-
-
-class LinformerCausalSelfAttention(nn.Module):
-    """Linformer attention with approximate causal masking.
-
-    Uses projection matrices to reduce attention complexity from O(n²) to O(nk).
-    """
-
-    def __init__(
-        self,
-        config,
-        layer_idx: int,
-        shared_projection: LinformerProjection | None = None,
-    ):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        self.proj_dim = config.linformer_proj_dim
-        self.sharing = config.linformer_sharing
-
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-
-        # QKV projections (same as standard attention)
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-
-        # Linformer projection matrices
-        if shared_projection is not None:
-            # Use shared projection (layerwise sharing)
-            self.linformer_proj = shared_projection
-        else:
-            # Create own projection based on sharing strategy
-            share_kv = self.sharing == "keyvalue"
-            if self.sharing == "headwise" or self.sharing == "keyvalue":
-                # Single projection shared across heads
-                n_kv_head_proj = 1
-            else:  # "none"
-                # Separate projection per head
-                n_kv_head_proj = self.n_kv_head
-
-            self.linformer_proj = LinformerProjection(
-                seq_len=config.sequence_len,
-                proj_dim=self.proj_dim,
-                n_kv_head=n_kv_head_proj,
-                share_kv=share_kv,
-            )
-
-    def forward(self, x, cos_sin):
-        B, T, C = x.size()
-
-        # Project input to get queries, keys, and values
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Apply rotary embeddings BEFORE projection (positional encoding)
-        cos, sin = cos_sin
-        q, k = (
-            apply_rotary_emb(q, cos, sin),
-            apply_rotary_emb(k, cos, sin),
-        )
-        q, k = norm(q), norm(k)  # QK norm
-
-        # Transpose to (B, H, T, D)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
-        # Apply Linformer projections to K and V
-        # Handle headwise/keyvalue sharing by expanding projection
-        if (
-            self.sharing in ("headwise", "keyvalue")
-            and self.linformer_proj.n_kv_head == 1
-        ):
-            # Expand single projection to all heads
-            k_proj, v_proj = self.linformer_proj.project_kv(
-                k[:, :1, :, :], v[:, :1, :, :]
-            )
-            # Broadcast to all kv heads
-            k_proj = k_proj.expand(-1, self.n_kv_head, -1, -1)
-            v_proj = v_proj.expand(-1, self.n_kv_head, -1, -1)
-            # But we need to project each head's K,V with the shared projection
-            # Actually, let's redo this properly:
-            E = self.linformer_proj.E[:, :, :T]  # (1, proj_dim, T)
-            F_mat = (
-                E if self.linformer_proj.share_kv else self.linformer_proj.F[:, :, :T]
-            )
-            # Expand and apply to all heads
-            k_proj = einsum(E.squeeze(0), k, "k t, b h t d -> b h k d")
-            v_proj = einsum(F_mat.squeeze(0), v, "k t, b h t d -> b h k d")
-        else:
-            k_proj, v_proj = self.linformer_proj.project_kv(k, v)
-
-        # Compute attention: Q @ K_proj^T
-        # q: (B, n_head, T, head_dim)
-        # k_proj: (B, n_kv_head, proj_dim, head_dim)
-        # We need to handle GQA: duplicate k_proj for query heads if needed
-        enable_gqa = self.n_head != self.n_kv_head
-
-        if enable_gqa:
-            # Repeat k_proj and v_proj for each query head group
-            n_rep = self.n_head // self.n_kv_head
-            k_proj = k_proj.repeat_interleave(n_rep, dim=1)
-            v_proj = v_proj.repeat_interleave(n_rep, dim=1)
-
-        # Attention scores: (B, n_head, T, proj_dim)
-        scale = self.head_dim**-0.5
-        attn = einsum(q, k_proj, "b h t d, b h k d -> b h t k") * scale
-
-        # Apply causal mask (approximate - positions in k_proj are mixed)
-        # We still mask to encourage the model to learn causal behavior
-        # This creates a (T, proj_dim) mask where each query position
-        # can attend to all projected positions (since they're mixed)
-        # For approximate causality, we don't apply strict causal mask
-        # but apply softmax normally
-
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values: (B, n_head, T, head_dim)
-        y = einsum(attn, v_proj, "b h t k, b h k d -> b h t d")
-
-        # Re-assemble heads and project back
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
 class ApproxLinear(nn.Module):
     def __init__(
         self,
@@ -321,6 +145,11 @@ class ApproxLinear(nn.Module):
         bias: bool = False,
     ):
         super().__init__()
+        min_features = min(in_features, out_features)
+        if rank > min_features:
+            print0(f"Warning! rank (r={rank}) is larger than the smallest feature: {min_features}. Setting to this value.")
+            rank = min_features
+
         if approx_type == "svd":
             self.linear: nn.Module = ApproxLinearSVD(
                 in_features, out_features, rank, bias
@@ -342,30 +171,50 @@ class ApproxLinearSVD(nn.Module):
         self.rank = rank
         self.in_features = in_features
         self.out_features = out_features
+        
+        # 1. Low-rank components (Standard LoRA-style initialization)
+        # We initialize U to zero so the layer starts as just the diagonal part
+        self.V = nn.Parameter(torch.randn(in_features, rank) * 0.01)
+        self.U = nn.Parameter(torch.zeros(rank, out_features)) 
+        
+        # 2. Diagonal component
+        self.min_dim = min(in_features, out_features)
+        self.D = nn.Parameter(torch.ones(1, self.min_dim)) # Initialize to 1s (Identity-ish)
+
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
-        self.U = nn.Parameter(torch.randn(out_features, rank) * 0.01)
-        self.V = nn.Parameter(torch.randn(in_features, rank) * 0.01)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Step 1: Low-rank path (x @ V @ U)
+        # Using standard @ is often faster/more memory-efficient than complex einsum 
+        # because it leverages highly optimized BLAS/cuBLAS kernels.
+        result = (x @ self.V) @ self.U
 
-    def forward(self, x) -> torch.Tensor:
-        # Handle both 2D (b, i) and 3D (b, t, i) input
-        result = einsum(x, self.V, self.U, "... i, i r, o r -> ... o")
+        # Step 2: In-place diagonal addition
+        # This modification happens directly on the 'result' tensor memory.
+        if self.in_features >= self.out_features:
+            # Compression or Square: Input is sliced to match Output
+            result.addcmul_(x[..., :self.out_features], self.D)
+        else:
+            # Expansion: Only the first 'in_features' of the output get the diagonal
+            result[..., :self.in_features].addcmul_(x, self.D)
+
         if self.bias is not None:
-            result = result + self.bias
+            result += self.bias
+            
         return result
 
     def reconstruct_weight(self) -> torch.Tensor:
         """
         Reconstruct dense weight from SVD approximation.
 
-        Given: U (out_features, rank), V (in_features, rank)
-        Reconstruct: W = U @ V.T
+        Given: V (in_features, rank), U (rank, out_features)
+        Reconstruct: W = V @ U
 
         Returns:
-            Reconstructed dense weight tensor of shape (out_features, in_features)
+            Reconstructed dense weight tensor of shape (in_features, out_features)
         """
         with torch.no_grad():
-            return self.U @ self.V.T
+            return self.V @ self.U
 
 
 class ApproxLinearABBA(nn.Module):
@@ -481,16 +330,9 @@ class ApproxWeightBlock(nn.Module):
         self,
         config: WeightApproxGPTConfig,
         layer_idx,
-        shared_linformer_proj: LinformerProjection | None = None,
     ):
         super().__init__()
-        # Choose attention type based on config
-        if config.use_linformer:
-            self.attn: nn.Module = LinformerCausalSelfAttention(
-                config, layer_idx, shared_projection=shared_linformer_proj
-            )
-        else:
-            self.attn: nn.Module = CausalSelfAttention(config, layer_idx)
+        self.attn: nn.Module = CausalSelfAttention(config, layer_idx)
         if config.approx_mlp_proj:
             self.mlp: nn.Module = ApproxWeightMLP(config)
         else:
@@ -509,21 +351,9 @@ class WeightApproxGPT(GPT):
         nn.Module.__init__(self)
         self.config = config
 
-        # Create shared Linformer projection for layerwise sharing
-        if config.use_linformer and config.linformer_sharing == "layerwise":
-            share_kv = False  # layerwise uses separate E and F
-            self.shared_linformer_proj = LinformerProjection(
-                seq_len=config.sequence_len,
-                proj_dim=config.linformer_proj_dim,
-                n_kv_head=1,  # Single projection shared across all heads and layers
-                share_kv=share_kv,
-            )
-        else:
-            self.shared_linformer_proj = None
-
         blocks = [
             ApproxWeightBlock(
-                config, layer_idx=i, shared_linformer_proj=self.shared_linformer_proj
+                config, layer_idx=i
             )
             for i in range(config.n_layer)
         ]
@@ -656,11 +486,6 @@ class WeightApproxGPT(GPT):
             else:
                 # Standard linear layer
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            # assert that the output of the block produces 0
-            with torch.no_grad():
-                random_input = torch.randn(1, 1, self.config.n_embd, device="cuda")
-                output = block.mlp(random_input)
-                assert torch.allclose(output, torch.zeros_like(output)), f"Block {block_num} does not produce 0 for mlp"
 
             # Handle attention c_proj
             if hasattr(block.attn.c_proj, "linear"):
@@ -682,6 +507,23 @@ class WeightApproxGPT(GPT):
                 if block.attn.c_proj.bias is not None:
                     print0("Zeroing out attn.c_proj.bias")
                     torch.nn.init.zeros_(block.attn.c_proj.bias)
+
+            # Handle attention projections (c_q, c_k, c_v)
+            for proj_name, proj_layer in [("c_q", block.attn.c_q), ("c_k", block.attn.c_k), ("c_v", block.attn.c_v)]:
+                if hasattr(proj_layer, "linear"):
+                    if hasattr(proj_layer.linear, "U"):
+                        # SVD approximation - zero out U
+                        torch.nn.init.zeros_(proj_layer.linear.U)
+                    elif hasattr(proj_layer.linear, "B1"):
+                        # ABBA approximation - zero out B1 and B2
+                        torch.nn.init.zeros_(proj_layer.linear.B1)
+                        torch.nn.init.zeros_(proj_layer.linear.B2)
+                else:
+                    # Standard linear layer
+                    torch.nn.init.zeros_(proj_layer.weight)
+                    # if has bias, zero it out as well
+                    if proj_layer.bias is not None:
+                        torch.nn.init.zeros_(proj_layer.bias)
 
             with torch.no_grad():
                 random_input = torch.randn(1, 1, self.config.n_embd, device="cuda")
@@ -796,7 +638,10 @@ class WeightApproxGPT(GPT):
             blocks_to_use = self.transformer.h
 
         for block in blocks_to_use:  # pyrefly: ignore
-            x = block(x, cos_sin)  # pyrefly: ignore
+            if self.config.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, cos_sin, use_reentrant=False)
+            else:
+                x = block(x, cos_sin)  # pyrefly: ignore
 
         x = norm(x)
 

@@ -35,12 +35,10 @@ class TrainSettings(BaseSettings):
     build_by_layer: bool = True
     # Whether to freeze previous blocks during training
     freeze_previous_weights: bool = True
-    # Whether to use Linformer attention
-    use_linformer: bool = False
-    # Projection dimension k for Linformer
-    linformer_proj_dim: int = 128
-    # Parameter sharing strategy for Linformer projections
-    linformer_sharing: str = "layerwise"
+    # Whether to use low-rank approximation for attention projections
+    approx_attn: bool = False
+    # Rank for low-rank attention approximation
+    attn_rank: int = 16
     # Training horizon. Only one of these 3 will be used, in this order of precedence.
     # explicit number of steps of the optimization (-1 = disable)
     num_iterations: int = -1
@@ -61,6 +59,8 @@ class TrainSettings(BaseSettings):
     matrix_lr: float = 0.02
     # gradient clipping value (0.0 = disabled)
     grad_clip: float = 1.0
+    # whether to use gradient checkpointing (process-memory trade-off)
+    gradient_checkpointing: bool = False
     # log per-layer gradients every N steps
     log_gradients_every: int = 10
     # log per-layer weights every N steps

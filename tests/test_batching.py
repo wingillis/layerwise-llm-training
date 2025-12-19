@@ -213,8 +213,7 @@ def test_block_shapes():
             approx_mlp_proj=True,
             mlp_proj_rank=cfg.mlp_proj_rank,
             build_by_layer=False,
-            use_linformer=False,
-        )
+                    )
 
         block = ApproxWeightBlock(config, layer_idx=0)
 
@@ -255,8 +254,7 @@ def test_block_shapes_compiled():
             approx_mlp_proj=True,
             mlp_proj_rank=cfg.mlp_proj_rank,
             build_by_layer=False,
-            use_linformer=False,
-        )
+                    )
 
         block = ApproxWeightBlock(config, layer_idx=0)
         compiled_block = torch.compile(block, dynamic=False)
@@ -298,8 +296,7 @@ def test_full_model_no_compile():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=False,  # Build all layers upfront, no compile
-        use_linformer=False,
-    )
+            )
 
     # Create model without compilation by modifying the class behavior
     # We'll build blocks manually without compile
@@ -377,8 +374,7 @@ def test_full_model_with_compile():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=False,
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 1000  # Large value to avoid adding layers
     model = WeightApproxGPT(config, freeze_every=freeze_every)
@@ -420,8 +416,7 @@ def test_build_by_layer_shapes():
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=True,  # This is the failing config
         freeze_previous_weights=False,
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 100  # Add layer every 100 steps
     model = WeightApproxGPT(config, freeze_every=freeze_every)
@@ -486,8 +481,7 @@ def test_multiple_batch_sizes():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=False,
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 1000
     model = WeightApproxGPT(config, freeze_every=freeze_every)
@@ -528,8 +522,7 @@ def test_training_loop_shapes():
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=True,
         freeze_previous_weights=False,
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 5  # Add layer every 5 steps for faster testing
     model = WeightApproxGPT(config, freeze_every=freeze_every)
@@ -576,8 +569,7 @@ def test_training_with_loss_reduction_none():
         approx_mlp_proj=True,
         mlp_proj_rank=cfg.mlp_proj_rank,
         build_by_layer=False,
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 1000
     model = WeightApproxGPT(config, freeze_every=freeze_every)
@@ -633,8 +625,7 @@ def test_exact_user_config():
         mlp_proj_rank=16,
         build_by_layer=True,
         freeze_previous_weights=True,  # User has this True
-        use_linformer=False,
-    )
+            )
 
     freeze_every = 507  # 5075 / 10 = 507.5
     model = WeightApproxGPT(config, freeze_every=freeze_every)

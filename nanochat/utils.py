@@ -17,7 +17,6 @@ from nanochat.approximated_gpt import (
     ApproxLinearABBA,
     ApproxWeightMLP,
     ApproxWeightBlock,
-    LinformerCausalSelfAttention,
 )
 from nanochat.common import print0, get_base_dir
 from nanochat.gpt import GPT, GPTConfig
@@ -569,76 +568,61 @@ def materialize_weights(
 
 def _convert_attention_weights(approx_attn, dense_attn, copy_weights: bool = True):
     """Convert attention layer weights from approximated to dense form."""
-    # Determine if we're dealing with Linformer or standard/approximated attention
-    if isinstance(approx_attn, LinformerCausalSelfAttention):
-        # Linformer case - copy the base weights (Q, K, V, proj)
-        # The E and F projection matrices are ignored for the dense model
+    # Standard attention case - check if weights are approximated
+    # For c_q (query projection)
+    if hasattr(approx_attn.c_q, "linear"):
+        # Approximated linear layer
+        dense_attn.c_q.weight.data = _convert_linear_weight(approx_attn.c_q).to(
+            device=dense_attn.c_q.weight.device, dtype=dense_attn.c_q.weight.dtype
+        )
+    else:
+        # Standard linear layer
         if copy_weights:
             dense_attn.c_q.weight.data.copy_(approx_attn.c_q.weight.data)
-            dense_attn.c_k.weight.data.copy_(approx_attn.c_k.weight.data)
-            dense_attn.c_v.weight.data.copy_(approx_attn.c_v.weight.data)
-            dense_attn.c_proj.weight.data.copy_(approx_attn.c_proj.weight.data)
         else:
             dense_attn.c_q.weight.data = approx_attn.c_q.weight.data
-            dense_attn.c_k.weight.data = approx_attn.c_k.weight.data
-            dense_attn.c_v.weight.data = approx_attn.c_v.weight.data
-            dense_attn.c_proj.weight.data = approx_attn.c_proj.weight.data
+
+    # For c_k (key projection)
+    if hasattr(approx_attn.c_k, "linear"):
+        # Approximated linear layer
+        dense_attn.c_k.weight.data = _convert_linear_weight(approx_attn.c_k).to(
+            device=dense_attn.c_k.weight.device, dtype=dense_attn.c_k.weight.dtype
+        )
     else:
-        # Standard attention case - check if weights are approximated
-        # For c_q (query projection)
-        if hasattr(approx_attn.c_q, "linear"):
-            # Approximated linear layer
-            dense_attn.c_q.weight.data = _convert_linear_weight(approx_attn.c_q).to(
-                device=dense_attn.c_q.weight.device, dtype=dense_attn.c_q.weight.dtype
-            )
+        # Standard linear layer
+        if copy_weights:
+            dense_attn.c_k.weight.data.copy_(approx_attn.c_k.weight.data)
         else:
-            # Standard linear layer
-            if copy_weights:
-                dense_attn.c_q.weight.data.copy_(approx_attn.c_q.weight.data)
-            else:
-                dense_attn.c_q.weight.data = approx_attn.c_q.weight.data
+            dense_attn.c_k.weight.data = approx_attn.c_k.weight.data
 
-        # For c_k (key projection)
-        if hasattr(approx_attn.c_k, "linear"):
-            # Approximated linear layer
-            dense_attn.c_k.weight.data = _convert_linear_weight(approx_attn.c_k).to(
-                device=dense_attn.c_k.weight.device, dtype=dense_attn.c_k.weight.dtype
-            )
+    # For c_v (value projection)
+    if hasattr(approx_attn.c_v, "linear"):
+        # Approximated linear layer
+        dense_attn.c_v.weight.data = _convert_linear_weight(approx_attn.c_v).to(
+            device=dense_attn.c_v.weight.device, dtype=dense_attn.c_v.weight.dtype
+        )
+    else:
+        # Standard linear layer
+        if copy_weights:
+            dense_attn.c_v.weight.data.copy_(approx_attn.c_v.weight.data)
         else:
-            # Standard linear layer
-            if copy_weights:
-                dense_attn.c_k.weight.data.copy_(approx_attn.c_k.weight.data)
-            else:
-                dense_attn.c_k.weight.data = approx_attn.c_k.weight.data
+            dense_attn.c_v.weight.data = approx_attn.c_v.weight.data
 
-        # For c_v (value projection)
-        if hasattr(approx_attn.c_v, "linear"):
-            # Approximated linear layer
-            dense_attn.c_v.weight.data = _convert_linear_weight(approx_attn.c_v).to(
-                device=dense_attn.c_v.weight.device, dtype=dense_attn.c_v.weight.dtype
+    # For c_proj (output projection)
+    if hasattr(approx_attn.c_proj, "linear"):
+        # Approximated linear layer
+        dense_attn.c_proj.weight.data = _convert_linear_weight(
+            approx_attn.c_proj
+        ).to(
+            device=dense_attn.c_proj.weight.device,
+            dtype=dense_attn.c_proj.weight.dtype,
             )
+    else:
+        # Standard linear layer
+        if copy_weights:
+            dense_attn.c_proj.weight.data.copy_(approx_attn.c_proj.weight.data)
         else:
-            # Standard linear layer
-            if copy_weights:
-                dense_attn.c_v.weight.data.copy_(approx_attn.c_v.weight.data)
-            else:
-                dense_attn.c_v.weight.data = approx_attn.c_v.weight.data
-
-        # For c_proj (output projection)
-        if hasattr(approx_attn.c_proj, "linear"):
-            # Approximated linear layer
-            dense_attn.c_proj.weight.data = _convert_linear_weight(
-                approx_attn.c_proj
-            ).to(
-                device=dense_attn.c_proj.weight.device,
-                dtype=dense_attn.c_proj.weight.dtype,
-            )
-        else:
-            # Standard linear layer
-            if copy_weights:
-                dense_attn.c_proj.weight.data.copy_(approx_attn.c_proj.weight.data)
-            else:
-                dense_attn.c_proj.weight.data = approx_attn.c_proj.weight.data
+            dense_attn.c_proj.weight.data = approx_attn.c_proj.weight.data
 
 
 def _convert_mlp_weights(approx_mlp, dense_mlp, copy_weights: bool = True):

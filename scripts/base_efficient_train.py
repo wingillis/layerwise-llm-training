@@ -157,10 +157,7 @@ def compute_model_config(
         lm_head_rank=settings.lm_head_rank,
         build_by_layer=settings.build_by_layer,
         freeze_previous_weights=settings.freeze_previous_weights,
-        use_linformer=settings.use_linformer,
-        linformer_proj_dim=settings.linformer_proj_dim,
-        linformer_sharing=settings.linformer_sharing,
-    )
+       )
 
     return model_config, grad_accum_steps
 
@@ -171,6 +168,7 @@ def create_model(
     checkpoint_dir,
     resume_from_step,
     ddp_rank,
+    build_by_layer: bool,
 ):
     """Create model on meta device, move to device, init weights, and handle checkpoint loading.
 
@@ -200,7 +198,7 @@ def create_model(
     orig_model = model
     num_params = sum(p.numel() for p in model.parameters())
     print0(f"Number of parameters: {num_params:,}")
-    model = torch.compile(model, dynamic=True)
+    model = torch.compile(model, dynamic=build_by_layer)
 
     return (
         model,
@@ -504,7 +502,10 @@ def train_loop(
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
-                loss = model(x, y, step=step)
+                if settings.build_by_layer:
+                    loss = model(x, y, step=step)
+                else:
+                    loss = model(x, y)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
@@ -700,9 +701,12 @@ def main(settings: TrainSettings):
         checkpoint_dir,
         resume_from_step,
         ddp_rank,
+        build_by_layer=settings.build_by_layer,
     )
     n_params = sum(p.numel() for p in model.transformer.h.parameters())
     print0(f"N params in transformer: {n_params:,}")
+    print0(f"N params in lm head: {sum(p.numel() for p in model.lm_head.parameters()):,}")
+    print0(f"N params in embedding: {sum(p.numel() for p in model.transformer.wte.parameters()):,}")
     print0(f"N params: {num_params:,}")
 
     # Compute training iterations

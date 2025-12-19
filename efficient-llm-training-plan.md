@@ -8,7 +8,6 @@
 
 - training the model one layer at a time: Y/N (assume yes to start)
 - Use Hadamard ABBA approximation
-- Performing a linformer-style low-rank approximation of the attention calculation: Y/N
 - Performing a low-rank approximation of the V matrix: Y/N
 - Performing a low-rank approximation of the MLP weights in each block: Y/N
 - Freeze weights of the previous layer: Y/N
