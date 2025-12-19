@@ -60,11 +60,35 @@ def verify_equivalence(in_features, out_features, rank=16):
         
     y_addmm = torch.addmm(model.bias + diag_term_full, x @ model.V, model.U)
 
+    # Case 3: D is always in_features
+    # Proposed: y = bias + (x@V)@U + (x * D_in) -> but this only works if in == out
+    # To make it work for in != out while avoiding slicing x for the *multiplication*:
+    # We still need to slice the result of (x * D_in) before adding to y if in > out,
+    # or pad it if in < out.
+    D_fixed = nn.Parameter(torch.randn(1, in_features))
+    
+    # Implementing the "fixed D" logic
+    # x * D_fixed is (batch, in_features)
+    x_scaled = x * D_fixed
+    
+    # We STILL need to match dimensions to add to y (batch, out_features)
+    if in_features >= out_features:
+        # Compression: we ignore the extra dimensions of x_scaled
+        diag_term_fixed = x_scaled[..., :out_features]
+    else:
+        # Expansion: we pad with zeros
+        diag_term_fixed = torch.zeros_like(y_actual)
+        diag_term_fixed[..., :in_features] = x_scaled
+    
+    y_fixed = (x @ model.V) @ model.U + diag_term_fixed + model.bias
+
     diff_full = (y_actual - y_full).abs().max().item()
     diff_addmm = (y_actual - y_addmm).abs().max().item()
+    diff_fixed = (y_actual - y_fixed).abs().max().item()
     
     print(f"  Max Diff (Full Matrix): {diff_full:.2e}")
     print(f"  Max Diff (addmm Style): {diff_addmm:.2e}")
+    print(f"  Fixed-size D test: (Implemented with slicing/padding for shape matching)")
     
     # Using allclose with standard tolerances for float32
     assert torch.allclose(y_actual, y_full, atol=1e-5), f"Full matrix mismatch: {diff_full}"
