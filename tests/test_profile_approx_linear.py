@@ -275,6 +275,7 @@ def compare_single_config(
 
     # 1. Profile nn.Linear
     linear = nn.Linear(in_features, out_features, bias=False).to(device)
+    linear = torch.compile(linear, dynamic=False)
     warmup_layer(linear, input_tensor, config.warmup_iters)
     linear_profile = profile_layer(linear, input_tensor, config.profile_iters)
     linear_memory = track_memory_usage(linear, input_tensor)
@@ -284,6 +285,7 @@ def compare_single_config(
 
     # 2. Profile ApproxLinearSVD
     approx = ApproxLinearSVD(in_features, out_features, rank=rank, bias=False).to(device)
+    approx = torch.compile(approx, dynamic=False, mode='max-autotune')
     warmup_layer(approx, input_tensor, config.warmup_iters)
     approx_profile = profile_layer(approx, input_tensor, config.profile_iters)
     approx_memory = track_memory_usage(approx, input_tensor)

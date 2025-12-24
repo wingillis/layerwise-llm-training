@@ -9,6 +9,7 @@ dependencies = [
     "einops>=0.8.1",
     "fastapi>=0.117.1",
     "files-to-prompt>=0.6",
+    "ninja>=1.13.0",
     "psutil>=7.1.0",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.12.0",

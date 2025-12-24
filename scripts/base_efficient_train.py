@@ -198,7 +198,7 @@ def create_model(
     orig_model = model
     num_params = sum(p.numel() for p in model.parameters())
     print0(f"Number of parameters: {num_params:,}")
-    model = torch.compile(model, dynamic=build_by_layer)
+    model = torch.compile(model, dynamic=build_by_layer, mode="default")
 
     return (
         model,
