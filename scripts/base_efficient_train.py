@@ -253,6 +253,7 @@ def setup_model(
         mlp_proj_rank=settings.mlp_proj_rank,
         approx_lm_head=settings.approx_lm_head,
         lm_head_rank=settings.lm_head_rank,
+        tie_embeddings=settings.tie_embeddings,
         build_by_layer=settings.build_by_layer,
         freeze_previous_weights=settings.freeze_previous_weights,
     )

@@ -55,7 +55,9 @@ class WeightApproxGPTConfig:
     attn_rank: int = 16
     # Whether to use gradient checkpointing
     gradient_checkpointing: bool = False
-  
+    # Whether to tie embedding and lm_head weights (parameter sharing)
+    tie_embeddings: bool = False
+
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
@@ -86,18 +88,42 @@ class CausalSelfAttention(nn.Module):
 
         # Use ApproxLinear for attention projections if configured
         if config.approx_attn:
-            self.c_q: nn.Module = ApproxLinear(self.n_embd, self.n_head * self.head_dim,
-                                   config.approx_type, config.attn_rank, bias=False)
-            self.c_k: nn.Module = ApproxLinear(self.n_embd, self.n_kv_head * self.head_dim,
-                                   config.approx_type, config.attn_rank, bias=False)
-            self.c_v: nn.Module = ApproxLinear(self.n_embd, self.n_kv_head * self.head_dim,
-                                   config.approx_type, config.attn_rank, bias=False)
-            self.c_proj: nn.Module = ApproxLinear(self.n_embd, self.n_embd,
-                                      config.approx_type, config.attn_rank, bias=False)
+            self.c_q: nn.Module = ApproxLinear(
+                self.n_embd,
+                self.n_head * self.head_dim,
+                config.approx_type,
+                config.attn_rank,
+                bias=False,
+            )
+            self.c_k: nn.Module = ApproxLinear(
+                self.n_embd,
+                self.n_kv_head * self.head_dim,
+                config.approx_type,
+                config.attn_rank,
+                bias=False,
+            )
+            self.c_v: nn.Module = ApproxLinear(
+                self.n_embd,
+                self.n_kv_head * self.head_dim,
+                config.approx_type,
+                config.attn_rank,
+                bias=False,
+            )
+            self.c_proj: nn.Module = ApproxLinear(
+                self.n_embd,
+                self.n_embd,
+                config.approx_type,
+                config.attn_rank,
+                bias=False,
+            )
         else:
             self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(
+                self.n_embd, self.n_kv_head * self.head_dim, bias=False
+            )
+            self.c_v = nn.Linear(
+                self.n_embd, self.n_kv_head * self.head_dim, bias=False
+            )
             self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, kv_cache):
@@ -147,7 +173,9 @@ class ApproxLinear(nn.Module):
         super().__init__()
         min_features = min(in_features, out_features)
         if rank > min_features:
-            print0(f"Warning! rank (r={rank}) is larger than the smallest feature: {min_features}. Setting to this value.")
+            print0(
+                f"Warning! rank (r={rank}) is larger than the smallest feature: {min_features}. Setting to this value."
+            )
             rank = min_features
 
         if approx_type == "svd":
@@ -171,21 +199,23 @@ class ApproxLinearSVD(nn.Module):
         self.rank = rank
         self.in_features = in_features
         self.out_features = out_features
-        
+
         # 1. Low-rank components (Standard LoRA-style initialization)
         # We initialize U to zero so the layer starts as just the diagonal part
         self.V = nn.Parameter(torch.randn(in_features, rank) * 0.01)
-        self.U = nn.Parameter(torch.zeros(rank, out_features)) 
-        
+        self.U = nn.Parameter(torch.zeros(rank, out_features))
+
         # 2. Diagonal component
         self.min_dim = min(in_features, out_features)
-        self.D = nn.Parameter(torch.ones(1, self.min_dim)) # Initialize to 1s (Identity-ish)
+        self.D = nn.Parameter(
+            torch.ones(1, self.min_dim)
+        )  # Initialize to 1s (Identity-ish)
 
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Step 1: Low-rank path (x @ V @ U)
-        # Using standard @ is often faster/more memory-efficient than complex einsum 
+        # Using standard @ is often faster/more memory-efficient than complex einsum
         # because it leverages highly optimized BLAS/cuBLAS kernels.
         result = (x @ self.V) @ self.U
 
@@ -193,14 +223,14 @@ class ApproxLinearSVD(nn.Module):
         # This modification happens directly on the 'result' tensor memory.
         if self.in_features >= self.out_features:
             # Compression or Square: Input is sliced to match Output
-            result.addcmul_(x[..., :self.out_features], self.D)
+            result.addcmul_(x[..., : self.out_features], self.D)
         else:
             # Expansion: Only the first 'in_features' of the output get the diagonal
-            result[..., :self.in_features].addcmul_(x, self.D)
+            result[..., : self.in_features].addcmul_(x, self.D)
 
         if self.bias is not None:
             result += self.bias
-            
+
         return result
 
     def reconstruct_weight(self) -> torch.Tensor:
@@ -351,12 +381,7 @@ class WeightApproxGPT(GPT):
         nn.Module.__init__(self)
         self.config = config
 
-        blocks = [
-            ApproxWeightBlock(
-                config, layer_idx=i
-            )
-            for i in range(config.n_layer)
-        ]
+        blocks = [ApproxWeightBlock(config, layer_idx=i) for i in range(config.n_layer)]
 
         if config.build_by_layer:
             print0("Building by layer")
@@ -371,7 +396,16 @@ class WeightApproxGPT(GPT):
                 "h": nn.ModuleList(blocks),
             }
         )
-        if config.approx_lm_head:
+        # Handle weight tying between wte and lm_head
+        if config.tie_embeddings:
+            if config.approx_lm_head:
+                raise ValueError(
+                    "tie_embeddings and approx_lm_head are mutually exclusive"
+                )
+            # self.lm_head = None  # Will use wte.weight in forward pass
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            self.lm_head.weight = self.transformer.wte.weight
+        elif config.approx_lm_head:
             self.lm_head = ApproxLinear(
                 config.n_embd,
                 config.vocab_size,
@@ -464,15 +498,19 @@ class WeightApproxGPT(GPT):
         # Initialize ApproxLinear parameters (not handled by _init_weights)
         self._init_approx_linear_weights()
 
-        # zero out classifier weights (only for non-ApproxLinear lm_head)
-        if not hasattr(self.lm_head, "linear"):
+        # zero out classifier weights (only for non-ApproxLinear lm_head and non-tied weights)
+        # Skip when lm_head is None (weights are tied with wte)
+        if self.lm_head is not None and not hasattr(self.lm_head, "linear"):
             # Standard linear layer - zero it out
             torch.nn.init.zeros_(self.lm_head.weight)  # pyrefly: ignore
         # Note: ApproxLinear lm_head keeps its random initialization
         # to provide gradient signal. Zeroing would cause zero output and vanishing gradients.
+        # Note: When lm_head is None (tied weights), wte initialization applies to both.
 
         # zero out c_proj weights in all blocks following the first (AFTER _init_approx_linear_weights)
-        for block_num, block in enumerate(self.transformer.h[1:], start=1):  # pyrefly: ignore
+        for block_num, block in enumerate(
+            self.transformer.h[1:], start=1
+        ):  # pyrefly: ignore
             print0(f"In block {block_num}")
             # Handle approximated c_proj weights
             if hasattr(block.mlp.c_proj, "linear"):
@@ -509,7 +547,11 @@ class WeightApproxGPT(GPT):
                     torch.nn.init.zeros_(block.attn.c_proj.bias)
 
             # Handle attention projections (c_q, c_k, c_v)
-            for proj_name, proj_layer in [("c_q", block.attn.c_q), ("c_k", block.attn.c_k), ("c_v", block.attn.c_v)]:
+            for proj_name, proj_layer in [
+                ("c_q", block.attn.c_q),
+                ("c_k", block.attn.c_k),
+                ("c_v", block.attn.c_v),
+            ]:
                 if hasattr(proj_layer, "linear"):
                     if hasattr(proj_layer.linear, "U"):
                         # SVD approximation - zero out U
@@ -528,7 +570,9 @@ class WeightApproxGPT(GPT):
             with torch.no_grad():
                 random_input = torch.randn(1, 1, self.config.n_embd, device="cuda")
                 output = block.attn.c_proj(random_input)
-                assert torch.allclose(output, torch.zeros_like(output)), f"Block {block_num} does not produce 0 for attn.c_proj"
+                assert torch.allclose(output, torch.zeros_like(output)), (
+                    f"Block {block_num} does not produce 0 for attn.c_proj"
+                )
 
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -543,13 +587,23 @@ class WeightApproxGPT(GPT):
     ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
+        # Separate out all parameters into groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(
-            embedding_params
-        ) + len(lm_head_params)
+
+        if self.lm_head is None:
+            # Weight tying: lm_head shares weights with wte
+            lm_head_params = []
+            # Adjust assertion for tied weights (lm_head doesn't add params)
+            assert len(list(self.parameters())) == len(matrix_params) + len(
+                embedding_params
+            )
+        else:
+            lm_head_params = list(self.lm_head.parameters())
+            assert len(list(self.parameters())) == len(matrix_params) + len(
+                embedding_params
+            ) + len(lm_head_params)
+
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -557,10 +611,18 @@ class WeightApproxGPT(GPT):
             print0(
                 f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
             )
-        adam_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
-        ]
+
+        if self.lm_head is None:
+            # Weight tying: use only embedding_lr for tied weights
+            adam_groups = [
+                dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            ]
+        else:
+            adam_groups = [
+                dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+                dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            ]
+
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
@@ -607,7 +669,9 @@ class WeightApproxGPT(GPT):
 
         return gate_level
 
-    def forward(self, idx, targets=None, loss_reduction="mean", step=None, kv_cache=None):
+    def forward(
+        self, idx, targets=None, loss_reduction="mean", step=None, kv_cache=None
+    ):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -621,8 +685,8 @@ class WeightApproxGPT(GPT):
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = (
-            self.cos[:, T0:T0+T],
-            self.sin[:, T0:T0+T],
+            self.cos[:, T0 : T0 + T],
+            self.sin[:, T0 : T0 + T],
         )  # truncate to current sequence length
 
         # Forward the trunk of the Transformer
@@ -641,7 +705,9 @@ class WeightApproxGPT(GPT):
 
         for block in blocks_to_use:  # pyrefly: ignore
             if self.config.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, cos_sin, kv_cache, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, cos_sin, kv_cache, use_reentrant=False
+                )
             else:
                 x = block(x, cos_sin, kv_cache)  # pyrefly: ignore
 
@@ -651,7 +717,11 @@ class WeightApproxGPT(GPT):
         softcap = 15
         if targets is not None:
             # training mode: compute and return the loss
-            logits = self.lm_head(x)
+            if self.lm_head is None:
+                # Weight tying: use wte.weight transposed
+                logits = F.linear(x, self.transformer.wte.weight)
+            else:
+                logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
             # Keep logits in bfloat16 to save memory - cross_entropy works fine with it
             loss = F.cross_entropy(
@@ -663,7 +733,11 @@ class WeightApproxGPT(GPT):
             return loss
         else:
             # inference mode: compute and return the logits
-            logits = self.lm_head(x)
+            if self.lm_head is None:
+                # Weight tying: use wte.weight transposed
+                logits = F.linear(x, self.transformer.wte.weight)
+            else:
+                logits = self.lm_head(x)
             logits = softcap * torch.tanh(logits / softcap)  # logits softcap
             return logits
 

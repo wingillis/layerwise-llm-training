@@ -31,6 +31,8 @@ class TrainSettings(BaseSettings):
     approx_lm_head: bool = False
     # Rank for low-rank lm_head approximation
     lm_head_rank: int = 16
+    # Whether to tie embedding and lm_head weights (parameter sharing)
+    tie_embeddings: bool = False
     # Whether to build model layer-by-layer incrementally
     build_by_layer: bool = True
     # Whether to freeze previous blocks during training
