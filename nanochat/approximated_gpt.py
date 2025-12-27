@@ -100,7 +100,7 @@ class CausalSelfAttention(nn.Module):
             self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
             self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin):
+    def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -338,8 +338,8 @@ class ApproxWeightBlock(nn.Module):
         else:
             self.mlp: nn.Module = MLP(config)
 
-    def forward(self, x, cos_sin):
-        attn_output = self.attn(norm(x), cos_sin)
+    def forward(self, x, cos_sin, kv_cache):
+        attn_output = self.attn(norm(x), cos_sin, kv_cache)
         x = x + attn_output
         mlp_output = self.mlp(norm(x))
         x = x + mlp_output
@@ -607,7 +607,7 @@ class WeightApproxGPT(GPT):
 
         return gate_level
 
-    def forward(self, idx, targets=None, loss_reduction="mean", step=None):
+    def forward(self, idx, targets=None, loss_reduction="mean", step=None, kv_cache=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -618,9 +618,11 @@ class WeightApproxGPT(GPT):
             f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         )
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = (
-            self.cos[:, :T],
-            self.sin[:, :T],
+            self.cos[:, T0:T0+T],
+            self.sin[:, T0:T0+T],
         )  # truncate to current sequence length
 
         # Forward the trunk of the Transformer
@@ -639,9 +641,9 @@ class WeightApproxGPT(GPT):
 
         for block in blocks_to_use:  # pyrefly: ignore
             if self.config.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, cos_sin, use_reentrant=False)
+                x = torch.utils.checkpoint.checkpoint(block, x, cos_sin, kv_cache, use_reentrant=False)
             else:
-                x = block(x, cos_sin)  # pyrefly: ignore
+                x = block(x, cos_sin, kv_cache)  # pyrefly: ignore
 
         x = norm(x)
 
