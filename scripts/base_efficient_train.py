@@ -14,7 +14,7 @@ python -m scripts.base_efficient_train --depth=4 --max_seq_len=512 --device_batc
 import os
 import time
 from pathlib import Path
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -55,6 +55,97 @@ get_max_memory = torch.cuda.max_memory_allocated
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
+# ============================================================================
+# State Data Classes
+# ============================================================================
+
+
+@dataclass
+class ComputeState:
+    """DDP/compute context state."""
+    ddp: bool
+    ddp_rank: int
+    ddp_local_rank: int
+    ddp_world_size: int
+    device: torch.device
+    synchronize: callable
+    master_process: bool
+    wandb_run: object
+
+
+@dataclass
+class TokenizerState:
+    """Tokenizer-related state."""
+    tokenizer: object
+    token_bytes: object
+    vocab_size: int
+
+
+@dataclass
+class ModelContext:
+    """Model and optimizer state."""
+    model: WeightApproxGPT
+    orig_model: WeightApproxGPT
+    config: WeightApproxGPTConfig
+    num_params: int
+    optimizers: tuple
+    meta_data: dict | None
+    freeze_every: int
+
+
+@dataclass
+class DataContext:
+    """Data loading state."""
+    train_loader: object
+    build_val_loader: callable
+    x: torch.Tensor
+    y: torch.Tensor
+    dataloader_state_dict: dict
+
+
+@dataclass
+class TrainingLoopState:
+    """Mutable training loop state."""
+    step: int
+    min_val_bpb: float
+    smooth_train_loss: float
+    total_training_time: float
+    val_bpb: float = float("inf")
+    results: dict | None = None
+
+    def to_dict(self) -> dict:
+        """Convert to dict for checkpoint serialization."""
+        return {
+            "step": self.step,
+            "min_val_bpb": self.min_val_bpb,
+            "smooth_train_loss": self.smooth_train_loss,
+            "total_training_time": self.total_training_time,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, meta_data: dict, resume_from_step: int) -> "TrainingLoopState":
+        """Create from checkpoint metadata."""
+        if resume_from_step != -1 and meta_data is not None:
+            loop_state = meta_data["loop_state"]
+            return cls(
+                step=meta_data["step"],
+                min_val_bpb=loop_state["min_val_bpb"],
+                smooth_train_loss=loop_state["smooth_train_loss"],
+                total_training_time=loop_state["total_training_time"],
+            )
+        return cls(
+            step=0,
+            min_val_bpb=float("inf"),
+            smooth_train_loss=0.0,
+            total_training_time=0.0,
+        )
+
+
+# ============================================================================
+# Setup Functions
+# ============================================================================
+
+
 def parse_settings(settings: TrainSettings):
     """Parse CLI arguments and load/create settings."""
     diff = set(settings.model_dump().items()) - set(
@@ -66,32 +157,32 @@ def parse_settings(settings: TrainSettings):
     return updated_params
 
 
-def setup_compute():
-    """Initialize DDP/compute context.
+def setup_environment(settings, user_config):
+    """Initialize DDP/compute context and wandb.
 
     Returns:
-        tuple: (ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, synchronize)
+        ComputeState: DDP/compute context including wandb run
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init("cuda")
     synchronize = torch.cuda.synchronize
+    master_process = ddp_rank == 0
 
-    return (
-        ddp,
-        ddp_rank,
-        ddp_local_rank,
-        ddp_world_size,
-        device,
-        synchronize,
-    )
-
-
-def setup_wandb(settings, master_process, user_config):
-    """Initialize wandb or dummy wandb for logging."""
     use_dummy_wandb = settings.run == "dummy" or not master_process
-    return (
+    wandb_run = (
         DummyWandb()
         if use_dummy_wandb
         else wandb.init(project="nanochat", name=settings.run, config=user_config)
+    )
+
+    return ComputeState(
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_local_rank=ddp_local_rank,
+        ddp_world_size=ddp_world_size,
+        device=device,
+        synchronize=synchronize,
+        master_process=master_process,
+        wandb_run=wandb_run,
     )
 
 
@@ -99,27 +190,33 @@ def setup_tokenizer(device):
     """Initialize tokenizer and get vocab info.
 
     Returns:
-        tuple: (tokenizer, token_bytes, vocab_size)
+        TokenizerState: Tokenizer, token bytes, and vocab size
     """
     tokenizer = get_tokenizer()
     token_bytes = get_token_bytes(device=device)
     vocab_size = tokenizer.get_vocab_size()
     print0(f"Vocab size: {vocab_size:,}")
-    return (tokenizer, token_bytes, vocab_size)
+    return TokenizerState(
+        tokenizer=tokenizer,
+        token_bytes=token_bytes,
+        vocab_size=vocab_size,
+    )
 
 
-def compute_model_config(
+def setup_model(
     settings,
-    vocab_size,
-    ddp_world_size,
+    tokenizer_state,
+    compute_state,
     device_batch_size,
     total_batch_size,
+    checkpoint_dir,
 ):
-    """Calculate model configuration and batch parameters.
+    """Configure, create, and setup model with optimizers.
 
     Returns:
-        tuple: (model_config_kwargs, num_layers, model_dim, grad_accum_steps)
+        tuple: (ModelContext, grad_accum_steps)
     """
+    # Calculate model configuration
     model_dim = settings.depth * 64  # aspect ratio 64
     num_heads = max(1, (model_dim + 127) // 128)  # head dim 128 (ceil div)
     num_kv_heads = num_heads  # default 1:1 GQA ratio
@@ -131,7 +228,7 @@ def compute_model_config(
 
     # Calculate gradient accumulation
     tokens_per_fwdbwd = device_batch_size * settings.max_seq_len
-    world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
+    world_tokens_per_fwdbwd = tokens_per_fwdbwd * compute_state.ddp_world_size
     assert total_batch_size % world_tokens_per_fwdbwd == 0
     grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 
@@ -145,7 +242,7 @@ def compute_model_config(
 
     model_config = WeightApproxGPTConfig(
         sequence_len=settings.max_seq_len,
-        vocab_size=vocab_size,
+        vocab_size=tokenizer_state.vocab_size,
         n_layer=settings.depth,
         n_head=num_heads,
         n_kv_head=num_kv_heads,
@@ -157,40 +254,25 @@ def compute_model_config(
         lm_head_rank=settings.lm_head_rank,
         build_by_layer=settings.build_by_layer,
         freeze_previous_weights=settings.freeze_previous_weights,
-       )
+    )
 
-    return model_config, grad_accum_steps
-
-
-def create_model(
-    model_config,
-    device,
-    checkpoint_dir,
-    resume_from_step,
-    ddp_rank,
-    build_by_layer: bool,
-):
-    """Create model on meta device, move to device, init weights, and handle checkpoint loading.
-
-    Returns:
-        tuple: (model, orig_model, model_config, optimizer_data, meta_data, num_params)
-    """
+    # Create model
     with torch.device("meta"):
         model = WeightApproxGPT(
             model_config,
             freeze_every=None,
         )
-    model.to_empty(device=device)
+    model.to_empty(device=compute_state.device)
     model.init_weights()
 
     optimizer_data = None
     meta_data = None
-    resuming = resume_from_step != -1
+    resuming = settings.resume_from_step != -1
 
     if resuming:
-        print0(f"Resuming optimization from step {resume_from_step}")
+        print0(f"Resuming optimization from step {settings.resume_from_step}")
         model_data, optimizer_data, meta_data = load_checkpoint(
-            checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank
+            checkpoint_dir, settings.resume_from_step, compute_state.device, load_optimizer=True, rank=compute_state.ddp_rank
         )
         model.load_state_dict(model_data, strict=True, assign=True)
         del model_data
@@ -198,15 +280,28 @@ def create_model(
     orig_model = model
     num_params = sum(p.numel() for p in model.parameters())
     print0(f"Number of parameters: {num_params:,}")
-    model = torch.compile(model, dynamic=build_by_layer, mode="default")
+    model = torch.compile(model, dynamic=settings.build_by_layer, mode="default")
 
-    return (
-        model,
-        orig_model,
-        optimizer_data,
-        meta_data,
-        num_params,
+    # Setup optimizers
+    optimizers = model.setup_optimizers(
+        unembedding_lr=settings.unembedding_lr,
+        embedding_lr=settings.embedding_lr,
+        matrix_lr=settings.matrix_lr,
+        weight_decay=settings.weight_decay,
     )
+
+    # freeze_every will be set later in main() after num_iterations is computed
+    model_context = ModelContext(
+        model=model,
+        orig_model=orig_model,
+        config=model_config,
+        num_params=num_params,
+        optimizers=optimizers,
+        meta_data=meta_data,
+        freeze_every=0,  # Will be set later
+    )
+
+    return model_context, grad_accum_steps
 
 
 def compute_training_iterations(settings, num_params, total_batch_size, num_iterations):
@@ -237,27 +332,11 @@ def compute_training_iterations(settings, num_params, total_batch_size, num_iter
     return (num_iterations, total_tokens)
 
 
-def setup_optimizers(model, settings):
-    """Create optimizers and load state if resuming.
-
-    Returns:
-        tuple: (adamw_optimizer, muon_optimizer)
-    """
-    optimizers = model.setup_optimizers(
-        unembedding_lr=settings.unembedding_lr,
-        embedding_lr=settings.embedding_lr,
-        matrix_lr=settings.matrix_lr,
-        weight_decay=settings.weight_decay,
-    )
-
-    return optimizers
-
-
 def setup_dataloaders(device, meta_data, device_batch_size, max_seq_len):
     """Create train loader and val loader builder.
 
     Returns:
-        tuple: (train_loader, build_val_loader, x, y, dataloader_state_dict)
+        DataContext: Data loaders and first batch
     """
     dataloader_resume_state_dict = (
         None if meta_data is None else meta_data["dataloader_state_dict"]
@@ -278,7 +357,13 @@ def setup_dataloaders(device, meta_data, device_batch_size, max_seq_len):
 
     x, y, dataloader_state_dict = next(train_loader)  # kick off first batch load
 
-    return (train_loader, build_val_loader, x, y, dataloader_state_dict)
+    return DataContext(
+        train_loader=train_loader,
+        build_val_loader=build_val_loader,
+        x=x,
+        y=y,
+        dataloader_state_dict=dataloader_state_dict,
+    )
 
 
 def setup_lr_scheduler(settings, num_iterations):
@@ -295,79 +380,24 @@ def init_loop_state(meta_data, resume_from_step):
     """Initialize or restore loop state variables.
 
     Returns:
-        dict: Loop state with step, min_val_bpb, smooth_train_loss, total_training_time
+        TrainingLoopState: Loop state with step, min_val_bpb, smooth_train_loss, total_training_time
     """
-    state = {
-        "step": 0,
-        "min_val_bpb": float("inf"),
-        "smooth_train_loss": 0,
-        "total_training_time": 0,
-    }
-
-    resuming = resume_from_step != -1
-    if resuming and meta_data is not None:
-        state["step"] = meta_data["step"]
-        loop_state = meta_data["loop_state"]
-        state["min_val_bpb"] = loop_state["min_val_bpb"]
-        state["smooth_train_loss"] = loop_state["smooth_train_loss"]
-        state["total_training_time"] = loop_state["total_training_time"]
-
-    return state
-
-
-def evaluate_validation_bpb(
-    model,
-    build_val_loader,
-    eval_batch_size,
-    settings,
-    token_bytes,
-    step,
-    ddp_world_size,
-):
-    """Evaluate validation bpb.
-
-    Returns:
-        tuple: (val_bpb, should_log)
-    """
-    with torch.no_grad():
-        model.eval()
-        val_loader = build_val_loader()
-        eval_steps = settings.eval_tokens // (
-            eval_batch_size * settings.max_seq_len * ddp_world_size
-        )
-        with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, step)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-    model.train()
-    return val_bpb
+    return TrainingLoopState.from_checkpoint(meta_data, resume_from_step)
 
 
 def train_loop(
-    model,
-    orig_model,
-    optimizers,
-    train_loader,
-    build_val_loader,
-    x,
-    y,
-    dataloader_state_dict,
-    tokenizer,
-    token_bytes,
+    model_context: ModelContext,
+    data_context: DataContext,
+    tokenizer_state: TokenizerState,
+    compute_state: ComputeState,
+    loop_state: TrainingLoopState,
     settings,
     user_config,
     checkpoint_dir,
     num_iterations,
     total_batch_size,
     grad_accum_steps,
-    freeze_every,
-    device,
-    synchronize,
-    wandb_run,
-    master_process,
-    ddp_rank,
-    ddp_world_size,
     get_lr_multiplier,
-    loop_state,
 ):
     """Main training loop."""
 
@@ -377,40 +407,42 @@ def train_loop(
 
     def build_val_loader():
         return tokenizing_distributed_data_loader(
-            eval_batch_size, settings.max_seq_len, split="val", device=device
+            eval_batch_size, settings.max_seq_len, split="val", device=compute_state.device
         )
 
-    step = loop_state["step"]
-    min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
-    total_training_time = loop_state["total_training_time"]
+    step = loop_state.step
+    min_val_bpb = loop_state.min_val_bpb
+    smooth_train_loss = loop_state.smooth_train_loss
+    total_training_time = loop_state.total_training_time
 
-    muon_optimizer = optimizers[1]
+    muon_optimizer = model_context.optimizers[1]
     val_bpb = float("inf")
     results = {}
 
     # Initialize gradient and weight monitors
-    gradient_monitor = GradientMonitor(orig_model)
-    weight_monitor = WeightMonitor(orig_model, log_frequency=settings.log_weights_every)
+    gradient_monitor = GradientMonitor(model_context.orig_model)
+    weight_monitor = WeightMonitor(model_context.orig_model, log_frequency=settings.log_weights_every)
 
     pbar = tqdm(range(num_iterations), desc="training")
     for mstep in pbar:  # pyrefly: ignore
         last_step = step == num_iterations
 
-        # Evaluate validation bpb
+        # Evaluate validation bpb (inlined from evaluate_validation_bpb)
         if last_step or step % settings.eval_every == 0 and step > 0:
-            val_bpb = evaluate_validation_bpb(
-                model,
-                build_val_loader,
-                eval_batch_size,
-                settings,
-                token_bytes,
-                step,
-                ddp_world_size,
-            )
+            with torch.no_grad():
+                model_context.model.eval()
+                val_loader = build_val_loader()
+                eval_steps = settings.eval_tokens // (
+                    eval_batch_size * settings.max_seq_len * compute_state.ddp_world_size
+                )
+                with autocast_ctx:
+                    val_bpb = evaluate_bpb(model_context.model, val_loader, eval_steps, tokenizer_state.token_bytes, step)
+                print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+            model_context.model.train()
+
             if val_bpb < min_val_bpb:
                 min_val_bpb = val_bpb
-            wandb_run.log(
+            compute_state.wandb_run.log(
                 {
                     "step": step,
                     "total_training_time": total_training_time,
@@ -423,29 +455,29 @@ def train_loop(
         if settings.core_metric_every > 0 and (
             last_step or (step > 0 and step % settings.core_metric_every == 0)
         ):
-            model.eval()
+            model_context.model.eval()
             with autocast_ctx:
                 results = evaluate_model(
-                    orig_model,
-                    tokenizer,
-                    device,
+                    model_context.orig_model,
+                    tokenizer_state.tokenizer,
+                    compute_state.device,
                     max_per_task=settings.core_metric_max_per_task,
                 )
             print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-            wandb_run.log(
+            compute_state.wandb_run.log(
                 {
                     "step": step,
                     "core_metric": results["core_metric"],
                     "centered_results": results["centered_results"],
                 }
             )
-            model.train()
+            model_context.model.train()
 
         # Sample from model
-        if master_process and (
+        if compute_state.master_process and (
             last_step or (step > 0 and step % settings.sample_every == 0)
         ):
-            model.eval()
+            model_context.model.eval()
             prompts = [
                 "The capital of France is",
                 "The chemical symbol of gold is",
@@ -455,15 +487,15 @@ def train_loop(
                 "My favorite color is",
                 "If 5*x + 3 = 13, then x is",
             ]
-            engine = Engine(orig_model, tokenizer)
+            engine = Engine(model_context.orig_model, tokenizer_state.tokenizer)
             for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
+                tokens = tokenizer_state.tokenizer(prompt, prepend="<|bos|>")
                 with autocast_ctx:
                     sample, _ = engine.generate_batch(
                         tokens, num_samples=1, max_tokens=16, temperature=0
                     )
-                print0(tokenizer.decode(sample[0]))
-            model.train()
+                print0(tokenizer_state.tokenizer.decode(sample[0]))
+            model_context.model.train()
 
         # Save checkpoint
         if last_step or (
@@ -472,44 +504,47 @@ def train_loop(
             and settings.save_every > 0
             and step % settings.save_every == 0
         ):
+            # Create updated loop state for checkpoint
+            checkpoint_loop_state = TrainingLoopState(
+                step=step,
+                min_val_bpb=min_val_bpb,
+                smooth_train_loss=smooth_train_loss,
+                total_training_time=total_training_time,
+            )
             save_checkpoint(
                 checkpoint_dir,
                 step,
-                orig_model.state_dict(),
-                [opt.state_dict() for opt in optimizers],
+                model_context.orig_model.state_dict(),
+                [opt.state_dict() for opt in model_context.optimizers],
                 {
                     "step": step,
                     "val_bpb": val_bpb,
-                    "model_config": asdict(model.config),
+                    "model_config": asdict(model_context.config),
                     "user_config": user_config,
                     "device_batch_size": device_batch_size,
                     "max_seq_len": settings.max_seq_len,
-                    "dataloader_state_dict": dataloader_state_dict,
-                    "loop_state": {
-                        "min_val_bpb": min_val_bpb,
-                        "smooth_train_loss": smooth_train_loss,
-                        "total_training_time": total_training_time,
-                    },
+                    "dataloader_state_dict": data_context.dataloader_state_dict,
+                    "loop_state": checkpoint_loop_state.to_dict(),
                 },
-                rank=ddp_rank,
+                rank=compute_state.ddp_rank,
             )
 
         if last_step:
             break
 
         # Training step
-        synchronize()
+        compute_state.synchronize()
         t0 = time.time()
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
                 if settings.build_by_layer:
-                    loss = model(x, y, step=step)
+                    loss = model_context.model(data_context.x, data_context.y, step=step)
                 else:
-                    loss = model(x, y)
+                    loss = model_context.model(data_context.x, data_context.y)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
-            x, y, dataloader_state_dict = next(train_loader)
+            data_context.x, data_context.y, data_context.dataloader_state_dict = next(data_context.train_loader)
 
         # Collect per-layer gradients after backward pass
         layer_grad_data = {}
@@ -523,22 +558,22 @@ def train_loop(
         grad_clip_enabled = settings.grad_clip > 0.0
         if grad_clip_enabled:
             grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
-                orig_model.parameters(), settings.grad_clip
+                model_context.orig_model.parameters(), settings.grad_clip
             )
             grad_norm = grad_norm_tensor.item()
 
         # Step optimizers
         lrm = get_lr_multiplier(step)
-        for opt in optimizers:
+        for opt in model_context.optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * lrm
         muon_momentum = get_muon_momentum(step)
         for group in muon_optimizer.param_groups:
             group["momentum"] = muon_momentum
-        for opt in optimizers:
+        for opt in model_context.optimizers:
             opt.step()
-        model.zero_grad(set_to_none=True)
-        synchronize()
+        model_context.model.zero_grad(set_to_none=True)
+        compute_state.synchronize()
         t1 = time.time()
         dt = t1 - t0
 
@@ -567,7 +602,7 @@ def train_loop(
                 "train/lrm": lrm,
                 "train/dt": dt,
                 "train/tok_per_sec": tok_per_sec,
-                "train/gate_level": step // freeze_every,
+                "train/gate_level": step // model_context.freeze_every,
             }
             if grad_clip_enabled:
                 log_data["train/grad_norm"] = grad_norm
@@ -577,7 +612,7 @@ def train_loop(
             # Add per-layer weight data if collected
             if layer_weight_data:
                 log_data.update(layer_weight_data)
-            wandb_run.log(log_data)
+            compute_state.wandb_run.log(log_data)
 
         step += 1
 
@@ -657,112 +692,72 @@ def main(settings: TrainSettings):
     resume_from_step = settings.resume_from_step
     model_tag = settings.model_tag
 
-    # Setup compute
-    (
-        ddp,
-        ddp_rank,
-        ddp_local_rank,
-        ddp_world_size,
-        device,
-        synchronize,
-    ) = setup_compute()
-    master_process = ddp_rank == 0
-
-    # Setup wandb
-    wandb_run = setup_wandb(settings, master_process, user_config)
+    # Setup environment (compute + wandb)
+    compute_state = setup_environment(settings, user_config)
 
     # Setup tokenizer
-    tokenizer, token_bytes, vocab_size = setup_tokenizer(device)
-
-    # Compute model config
-    model_config, grad_accum_steps = compute_model_config(
-        settings,
-        vocab_size,
-        ddp_world_size,
-        device_batch_size,
-        total_batch_size,
-    )
+    tokenizer_state = setup_tokenizer(compute_state.device)
 
     # Setup checkpoint directory
     base_dir = Path(get_base_dir() or ".")
     output_dirname = model_tag if model_tag else f"d{settings.depth}"
     checkpoint_dir = base_dir / "base_checkpoints" / output_dirname
 
-    # Create model
-    (
-        model,
-        orig_model,
-        optimizer_data,
-        meta_data,
-        num_params,
-    ) = create_model(
-        model_config,
-        device,
+    # Setup model (config + model + optimizers)
+    model_context, grad_accum_steps = setup_model(
+        settings,
+        tokenizer_state,
+        compute_state,
+        device_batch_size,
+        total_batch_size,
         checkpoint_dir,
-        resume_from_step,
-        ddp_rank,
-        build_by_layer=settings.build_by_layer,
     )
-    n_params = sum(p.numel() for p in model.transformer.h.parameters())
+
+    # Print parameter breakdown
+    n_params = sum(p.numel() for p in model_context.model.transformer.h.parameters())
     print0(f"N params in transformer: {n_params:,}")
-    print0(f"N params in lm head: {sum(p.numel() for p in model.lm_head.parameters()):,}")
-    print0(f"N params in embedding: {sum(p.numel() for p in model.transformer.wte.parameters()):,}")
-    print0(f"N params: {num_params:,}")
+    print0(f"N params in lm head: {sum(p.numel() for p in model_context.model.lm_head.parameters()):,}")
+    print0(f"N params in embedding: {sum(p.numel() for p in model_context.model.transformer.wte.parameters()):,}")
+    print0(f"N params: {model_context.num_params:,}")
 
     # Compute training iterations
     num_iterations, total_tokens = compute_training_iterations(
-        settings, num_params, total_batch_size, num_iterations
+        settings, model_context.num_params, total_batch_size, num_iterations
     )
     print0(f"Updating num_iterations to {num_iterations} in settings")
     settings = settings.model_copy(update={"num_iterations": num_iterations})
-    # explicitly set here after we compute num_iterations
-    model.freeze_every = num_iterations // settings.depth
 
-    # Setup optimizers
-    optimizers = setup_optimizers(model, settings)
+    # Calculate and set freeze_every
+    freeze_every = num_iterations // settings.depth
+    model_context.freeze_every = freeze_every
+    model_context.model.freeze_every = freeze_every
+    print0(f"Adding layer every {freeze_every} iterations")
 
     # Setup dataloaders
-    (train_loader, build_val_loader, x, y, dataloader_state_dict) = setup_dataloaders(
-        device, meta_data, device_batch_size, settings.max_seq_len
+    data_context = setup_dataloaders(
+        compute_state.device, model_context.meta_data, device_batch_size, settings.max_seq_len
     )
 
     # Setup LR scheduler
     get_lr_multiplier = setup_lr_scheduler(settings, num_iterations)
 
     # Initialize loop state
-    loop_state = init_loop_state(meta_data, resume_from_step)
-
-    # Calculate freeze_every for train loop
-    freeze_every = num_iterations // settings.depth
-    print0(f"Adding layer every {freeze_every} iterations")
+    loop_state = init_loop_state(model_context.meta_data, resume_from_step)
 
     # Run training loop
     train_results = train_loop(
-        model,
-        orig_model,
-        optimizers,
-        train_loader,
-        build_val_loader,
-        x,
-        y,
-        dataloader_state_dict,
-        tokenizer,
-        token_bytes,
+        model_context,
+        data_context,
+        tokenizer_state,
+        compute_state,
+        loop_state,
         settings,
         user_config,
         checkpoint_dir,
         num_iterations,
         total_batch_size,
         grad_accum_steps,
-        freeze_every,
-        device,
-        synchronize,
-        wandb_run,
-        master_process,
-        ddp_rank,
-        ddp_world_size,
         get_lr_multiplier,
-        loop_state,
     )
 
     # Log final results
@@ -772,14 +767,14 @@ def main(settings: TrainSettings):
         train_results["val_bpb"],
         train_results["results"],
         user_config,
-        num_params,
+        model_context.num_params,
         num_iterations,
         total_tokens,
         total_batch_size,
-        ddp_world_size,
+        compute_state.ddp_world_size,
         settings,
-        train_results["mfu"],
-        wandb_run,
+        train_results.get("mfu", 0.0),
+        compute_state.wandb_run,
     )
 
     # Cleanup

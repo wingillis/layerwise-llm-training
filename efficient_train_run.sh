@@ -36,3 +36,5 @@ fi
 uv run python -m scripts.base_efficient_train --depth 20 --approx-type=svd --run=test-svd 
 # NOTE: there's something wrong with abba initialization.
 # uv run python -m scripts.base_efficient_train --depth 20 --approx-type=abba --run=test-abba 
+
+# TODO: implement torchrun optimizations for distributed training (if necessary)
