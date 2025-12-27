@@ -15,6 +15,7 @@ import os
 import time
 from pathlib import Path
 from dataclasses import asdict, dataclass
+from typing import Callable, Any, TYPE_CHECKING
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -68,16 +69,16 @@ class ComputeState:
     ddp_local_rank: int
     ddp_world_size: int
     device: torch.device
-    synchronize: callable
+    synchronize: Callable[[], None]
     master_process: bool
-    wandb_run: object
+    wandb_run: Any  # wandb.sdk.wandb_run.Run | DummyWandb
 
 
 @dataclass
 class TokenizerState:
     """Tokenizer-related state."""
-    tokenizer: object
-    token_bytes: object
+    tokenizer: Any  # tiktoken.core.Tokenizer
+    token_bytes: Any  # torch.Tensor
     vocab_size: int
 
 
@@ -88,19 +89,19 @@ class ModelContext:
     orig_model: WeightApproxGPT
     config: WeightApproxGPTConfig
     num_params: int
-    optimizers: tuple
-    meta_data: dict | None
+    optimizers: tuple[torch.optim.Optimizer, ...]
+    meta_data: dict[str, Any] | None
     freeze_every: int
 
 
 @dataclass
 class DataContext:
     """Data loading state."""
-    train_loader: object
-    build_val_loader: callable
+    train_loader: Any  # Generator yielding batches
+    build_val_loader: Callable[[], Any]
     x: torch.Tensor
     y: torch.Tensor
-    dataloader_state_dict: dict
+    dataloader_state_dict: dict[str, Any]
 
 
 @dataclass
@@ -111,9 +112,9 @@ class TrainingLoopState:
     smooth_train_loss: float
     total_training_time: float
     val_bpb: float = float("inf")
-    results: dict | None = None
+    results: dict[str, Any] | None = None
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, float | int]:
         """Convert to dict for checkpoint serialization."""
         return {
             "step": self.step,
@@ -123,7 +124,7 @@ class TrainingLoopState:
         }
 
     @classmethod
-    def from_checkpoint(cls, meta_data: dict, resume_from_step: int) -> "TrainingLoopState":
+    def from_checkpoint(cls, meta_data: dict[str, Any] | None, resume_from_step: int) -> "TrainingLoopState":
         """Create from checkpoint metadata."""
         if resume_from_step != -1 and meta_data is not None:
             loop_state = meta_data["loop_state"]
@@ -146,7 +147,7 @@ class TrainingLoopState:
 # ============================================================================
 
 
-def parse_settings(settings: TrainSettings):
+def parse_settings(settings: TrainSettings) -> TrainSettings:
     """Parse CLI arguments and load/create settings."""
     diff = set(settings.model_dump().items()) - set(
         TrainSettings().model_dump().items()
@@ -157,7 +158,7 @@ def parse_settings(settings: TrainSettings):
     return updated_params
 
 
-def setup_environment(settings, user_config):
+def setup_environment(settings: TrainSettings, user_config: TrainSettings) -> ComputeState:
     """Initialize DDP/compute context and wandb.
 
     Returns:
@@ -186,7 +187,7 @@ def setup_environment(settings, user_config):
     )
 
 
-def setup_tokenizer(device):
+def setup_tokenizer(device: torch.device) -> TokenizerState:
     """Initialize tokenizer and get vocab info.
 
     Returns:
@@ -204,13 +205,13 @@ def setup_tokenizer(device):
 
 
 def setup_model(
-    settings,
-    tokenizer_state,
-    compute_state,
-    device_batch_size,
-    total_batch_size,
-    checkpoint_dir,
-):
+    settings: TrainSettings,
+    tokenizer_state: TokenizerState,
+    compute_state: ComputeState,
+    device_batch_size: int,
+    total_batch_size: int,
+    checkpoint_dir: Path,
+) -> tuple[ModelContext, int]:
     """Configure, create, and setup model with optimizers.
 
     Returns:
@@ -304,7 +305,12 @@ def setup_model(
     return model_context, grad_accum_steps
 
 
-def compute_training_iterations(settings, num_params, total_batch_size, num_iterations):
+def compute_training_iterations(
+    settings: TrainSettings,
+    num_params: int,
+    total_batch_size: int,
+    num_iterations: int,
+) -> tuple[int, int]:
     """Calculate number of training iterations based on settings.
 
     Returns:
@@ -332,7 +338,12 @@ def compute_training_iterations(settings, num_params, total_batch_size, num_iter
     return (num_iterations, total_tokens)
 
 
-def setup_dataloaders(device, meta_data, device_batch_size, max_seq_len):
+def setup_dataloaders(
+    device: torch.device,
+    meta_data: dict[str, Any] | None,
+    device_batch_size: int,
+    max_seq_len: int,
+) -> DataContext:
     """Create train loader and val loader builder.
 
     Returns:
@@ -366,7 +377,7 @@ def setup_dataloaders(device, meta_data, device_batch_size, max_seq_len):
     )
 
 
-def setup_lr_scheduler(settings, num_iterations):
+def setup_lr_scheduler(settings: TrainSettings, num_iterations: int) -> Callable[[int], float]:
     """Create LR multiplier function."""
     return lr_multiplier_factory(
         warmup_ratio=settings.warmup_ratio,
@@ -376,7 +387,7 @@ def setup_lr_scheduler(settings, num_iterations):
     )
 
 
-def init_loop_state(meta_data, resume_from_step):
+def init_loop_state(meta_data: dict[str, Any] | None, resume_from_step: int) -> TrainingLoopState:
     """Initialize or restore loop state variables.
 
     Returns:
@@ -391,15 +402,19 @@ def train_loop(
     tokenizer_state: TokenizerState,
     compute_state: ComputeState,
     loop_state: TrainingLoopState,
-    settings,
-    user_config,
-    checkpoint_dir,
-    num_iterations,
-    total_batch_size,
-    grad_accum_steps,
-    get_lr_multiplier,
-):
-    """Main training loop."""
+    settings: TrainSettings,
+    user_config: TrainSettings,
+    checkpoint_dir: Path,
+    num_iterations: int,
+    total_batch_size: int,
+    grad_accum_steps: int,
+    get_lr_multiplier: Callable[[int], float],
+) -> dict[str, Any]:
+    """Main training loop.
+
+    Returns:
+        dict with keys: min_val_bpb, val_bpb, results, total_training_time
+    """
 
     device_batch_size = settings.device_batch_size
     # Use smaller batch size for evaluation since loss_reduction='none' requires more memory
@@ -627,20 +642,20 @@ def train_loop(
 
 
 def log_final_results(
-    total_training_time,
-    min_val_bpb,
-    val_bpb,
-    results,
-    user_config,
-    num_params,
-    num_iterations,
-    total_tokens,
-    total_batch_size,
-    ddp_world_size,
-    settings,
-    mfu,
-    wandb_run,
-):
+    total_training_time: float,
+    min_val_bpb: float,
+    val_bpb: float,
+    results: dict[str, Any],
+    user_config: TrainSettings,
+    num_params: int,
+    num_iterations: int,
+    total_tokens: int,
+    total_batch_size: int,
+    ddp_world_size: int,
+    settings: TrainSettings,
+    mfu: float,
+    wandb_run: Any,
+) -> None:
     """Print final stats, log to report, and cleanup."""
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
     print0(f"Total training time: {total_training_time / 60:.2f}m")
@@ -676,7 +691,7 @@ def log_final_results(
     wandb_run.finish()
 
 
-def main(settings: TrainSettings):
+def main(settings: TrainSettings) -> None:
     load_dotenv(override=True)
     # print_banner()
 
