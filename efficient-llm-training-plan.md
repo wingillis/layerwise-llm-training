@@ -25,9 +25,6 @@ Approach for modifying the codebase to allow for testing these axes of variation
 
 Make a new construction function/method that adds a block to the `self.transformer.h` `ModuleList`. Should take in a few parameters to compile it, and to create a low-rank approximation of any parts of the transformer `Block`.
 
-Each time a new layer is added, the `find_optimal_batch_size` function should be re-run and used to set the batch size.
-- Cache the outputs of this function into a file, so that I don't have to re-run if the inputs are exactly the same
-
 ### Linformer-style Low-rank approximation of attention calculation
 
 Create a low-rank approximation of attention with linformer causal attention.
