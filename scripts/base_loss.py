@@ -8,6 +8,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
 """
 import os
 from contextlib import nullcontext
+from pathlib import Path
 import torch
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import compute_init, print0, compute_cleanup, autodetect_device_type
@@ -22,7 +23,7 @@ split_tokens = 20*524288  # number of tokens to evaluate per split
 model_tag = None # optional model tag for the output directory name
 model_step = None # optional model step for the output directory name
 device_type = "" # cuda|cpu|mps (empty => autodetect)
-exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
+exec((Path('nanochat') / 'configurator.py').read_text()) # overrides from command line or config file
 
 # Load the base model and the tokenizer
 device_type = autodetect_device_type() if device_type == "" else device_type

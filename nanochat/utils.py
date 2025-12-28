@@ -62,8 +62,7 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
                 with FileLock(str(lock_file)):
                     if cache_file.exists():
                         try:
-                            with open(cache_file, "r", encoding="utf-8") as f:
-                                cached = json.load(f)
+                            cached = json.loads(cache_file.read_text(encoding="utf-8"))
                             print0(
                                 f"[disk_cache] Cache hit for {func.__name__} (key={key_hash})"
                             )
@@ -82,8 +81,7 @@ def disk_cache(key_fn, cache_name, cache_dir=None):
                     "result": result,
                     "timestamp": datetime.now().isoformat(),
                 }
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(cache_entry, f, indent=2)
+                cache_file.write_text(json.dumps(cache_entry, indent=2), encoding="utf-8")
 
             return result
 

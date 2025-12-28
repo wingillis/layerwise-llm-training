@@ -587,7 +587,7 @@ def get_cuda_module():
             # Create temporary directory for compilation
             with tempfile.TemporaryDirectory() as temp_dir:
                 # Write CUDA source to temporary file
-                cuda_file = os.path.join(temp_dir, "fused_kernel.cu")
+                cuda_file = Path(temp_dir) / "fused_kernel.cu"
                 with open(cuda_file, 'w') as f:
                     f.write(CUDA_KERNEL_SOURCE)
 
