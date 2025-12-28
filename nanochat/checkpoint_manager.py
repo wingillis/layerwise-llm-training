@@ -93,59 +93,62 @@ def build_model(checkpoint_dir, step, device, phase):
     return model, tokenizer, meta_data
 
 
-def find_largest_model(checkpoint_dir):
-    # attempt to guess the model tag: take the biggest model available
-    model_tags = [f for f in os.listdir(checkpoint_dir) if os.path.isdir(os.path.join(checkpoint_dir, f))]
-    if not model_tags:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    # 1) normally all model tags are of the form d<number>, try that first:
-    candidates = []
-    for model_tag in model_tags:
-        match = re.match(r"d(\d+)", model_tag)
-        if match:
-            model_depth = int(match.group(1))
-            candidates.append((model_depth, model_tag))
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
-    # 2) if that failed, take the most recently updated model:
-    model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoint_dir, x)), reverse=True)
-    return model_tags[0]
+def _resolve_checkpoint_path(checkpoints_dir, model_tag=None, step=None):
+    """Resolve checkpoint directory and step, guessing if not provided."""
+    if model_tag is None:
+        # guess the model tag by defaulting to the largest model
+        model_tags = [f for f in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, f))]
+        if not model_tags:
+            raise FileNotFoundError(f"No checkpoints found in {checkpoints_dir}")
+        # normally all model tags are of the form d<number>, try that first:
+        candidates = []
+        for model_tag in model_tags:
+            match = re.match(r"d(\d+)", model_tag)
+            if match:
+                model_depth = int(match.group(1))
+                candidates.append((model_depth, model_tag))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            model_tag = candidates[0][1]
+        else:
+            # if that failed, take the most recently updated model:
+            model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
+            model_tag = model_tags[0]
+        log0(f"No model tag provided, guessing model tag: {model_tag}")
 
+    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
 
-def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
-    if not checkpoint_files:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
-    last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
-    return last_step
+    if step is None:
+        # guess the step by defaulting to the last step
+        checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
+        if not checkpoint_files:
+            raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+        step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))
+
+    return checkpoint_dir, step
 
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=None):
-    if model_tag is None:
-        # guess the model tag by defaulting to the largest model
-        model_tag = find_largest_model(checkpoints_dir)
-        log0(f"No model tag provided, guessing model tag: {model_tag}")
-    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
-    if step is None:
-        # guess the step by defaulting to the last step
-        step = find_last_step(checkpoint_dir)
-    assert step is not None, f"No checkpoints found in {checkpoint_dir}"
-    # build the model
+def load_model(source, device, phase, model_tag=None, step=None):
+    """Load a model from checkpoints directory.
+
+    Args:
+        source: Must be "base"
+        device: Device to load model onto
+        phase: "train" or "eval"
+        model_tag: Optional model tag (e.g., "d6"). If None, finds largest.
+        step: Optional checkpoint step. If None, finds latest.
+
+    Returns:
+        model, tokenizer, meta_data
+    """
+    if source != "base":
+        raise ValueError(f"Only 'base' checkpoints are supported, got: {source}")
+    base_dir = get_base_dir()
+    checkpoints_dir = os.path.join(base_dir, "base_checkpoints")
+
+    checkpoint_dir, step = _resolve_checkpoint_path(checkpoints_dir, model_tag, step)
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
     return model, tokenizer, meta_data
-
-def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "mid": "mid_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
