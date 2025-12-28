@@ -191,7 +191,11 @@ orig_model = model  # original, uncompiled model, for saving raw model state_dic
 model = torch.compile(
     model, dynamic=False
 )  # the inputs to model will never change shape so dynamic=False is safe
+# Calculate total parameters, accounting for tied embeddings
 num_params = sum(p.numel() for p in model.parameters())
+if orig_model.config.tie_embeddings:
+    # Subtract duplicate count: lm_head.weight shares wte.weight
+    num_params -= orig_model.transformer.wte.weight.numel()
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")

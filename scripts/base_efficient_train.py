@@ -299,7 +299,11 @@ def setup_model(
                 model.prev_gate_level = meta_data["prev_gate_level"]
 
     orig_model = model
+    # Calculate total parameters, accounting for tied embeddings
     num_params = sum(p.numel() for p in model.parameters())
+    if model.config.tie_embeddings:
+        # Subtract duplicate count: lm_head.weight shares wte.weight
+        num_params -= model.transformer.wte.weight.numel()
     print0(f"Number of parameters: {num_params:,}")
     model = torch.compile(model, dynamic=settings.build_by_layer, mode="default")
 
@@ -784,13 +788,18 @@ def main(settings: TrainSettings) -> None:
     # Print parameter breakdown
     n_params = sum(p.numel() for p in model_context.model.transformer.h.parameters())
     print0(f"N params in transformer: {n_params:,}")
-    print0(
-        f"N params in lm head: {sum(p.numel() for p in model_context.model.lm_head.parameters()):,}"
+    lm_head_params = sum(p.numel() for p in model_context.model.lm_head.parameters())
+    embedding_params = sum(
+        p.numel() for p in model_context.model.transformer.wte.parameters()
     )
-    print0(
-        f"N params in embedding: {sum(p.numel() for p in model_context.model.transformer.wte.parameters()):,}"
-    )
-    print0(f"N params: {model_context.num_params:,}")
+    if model_context.model.config.tie_embeddings:
+        print0(f"N params in lm head: {lm_head_params:,} (tied to embedding)")
+        print0(f"N params in embedding: {embedding_params:,}")
+        print0(f"N params (unique): {model_context.num_params:,}")
+    else:
+        print0(f"N params in lm head: {lm_head_params:,}")
+        print0(f"N params in embedding: {embedding_params:,}")
+        print0(f"N params: {model_context.num_params:,}")
 
     # Compute training iterations
     num_iterations, total_tokens = compute_training_iterations(
