@@ -15,7 +15,7 @@ import os
 import time
 from pathlib import Path
 from dataclasses import asdict, dataclass
-from typing import Callable, Any, TYPE_CHECKING
+from typing import Callable, Any
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -35,7 +35,6 @@ from nanochat.common import (
     compute_cleanup,
     print0,
     DummyWandb,
-    print_banner,
     get_base_dir,
 )
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -64,6 +63,7 @@ autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 @dataclass
 class ComputeState:
     """DDP/compute context state."""
+
     ddp: bool
     ddp_rank: int
     ddp_local_rank: int
@@ -77,6 +77,7 @@ class ComputeState:
 @dataclass
 class TokenizerState:
     """Tokenizer-related state."""
+
     tokenizer: Any  # tiktoken.core.Tokenizer
     token_bytes: Any  # torch.Tensor
     vocab_size: int
@@ -85,6 +86,7 @@ class TokenizerState:
 @dataclass
 class ModelContext:
     """Model and optimizer state."""
+
     model: WeightApproxGPT
     orig_model: WeightApproxGPT
     config: WeightApproxGPTConfig
@@ -97,6 +99,7 @@ class ModelContext:
 @dataclass
 class DataContext:
     """Data loading state."""
+
     train_loader: Any  # Generator yielding batches
     build_val_loader: Callable[[], Any]
     x: torch.Tensor
@@ -107,6 +110,7 @@ class DataContext:
 @dataclass
 class TrainingLoopState:
     """Mutable training loop state."""
+
     step: int
     min_val_bpb: float
     smooth_train_loss: float
@@ -124,7 +128,9 @@ class TrainingLoopState:
         }
 
     @classmethod
-    def from_checkpoint(cls, meta_data: dict[str, Any] | None, resume_from_step: int) -> "TrainingLoopState":
+    def from_checkpoint(
+        cls, meta_data: dict[str, Any] | None, resume_from_step: int
+    ) -> "TrainingLoopState":
         """Create from checkpoint metadata."""
         if resume_from_step != -1 and meta_data is not None:
             loop_state = meta_data["loop_state"]
@@ -158,7 +164,9 @@ def parse_settings(settings: TrainSettings) -> TrainSettings:
     return updated_params
 
 
-def setup_environment(settings: TrainSettings, user_config: TrainSettings) -> ComputeState:
+def setup_environment(
+    settings: TrainSettings, user_config: TrainSettings
+) -> ComputeState:
     """Initialize DDP/compute context and wandb.
 
     Returns:
@@ -274,10 +282,21 @@ def setup_model(
     if resuming:
         print0(f"Resuming optimization from step {settings.resume_from_step}")
         model_data, optimizer_data, meta_data = load_checkpoint(
-            checkpoint_dir, settings.resume_from_step, compute_state.device, load_optimizer=True, rank=compute_state.ddp_rank
+            checkpoint_dir,
+            settings.resume_from_step,
+            compute_state.device,
+            load_optimizer=True,
+            rank=compute_state.ddp_rank,
         )
         model.load_state_dict(model_data, strict=True, assign=True)
         del model_data
+
+        # Restore layer-wise training state
+        if meta_data is not None:
+            if "freeze_every" in meta_data:
+                model.freeze_every = meta_data["freeze_every"]
+            if "prev_gate_level" in meta_data:
+                model.prev_gate_level = meta_data["prev_gate_level"]
 
     orig_model = model
     num_params = sum(p.numel() for p in model.parameters())
@@ -292,6 +311,11 @@ def setup_model(
         weight_decay=settings.weight_decay,
     )
 
+    # Preserve freeze_every from checkpoint if resuming, otherwise 0 (will be set later)
+    freeze_every_from_checkpoint = (
+        meta_data.get("freeze_every", 0) if resuming and meta_data else 0
+    )
+
     # freeze_every will be set later in main() after num_iterations is computed
     model_context = ModelContext(
         model=model,
@@ -300,7 +324,7 @@ def setup_model(
         num_params=num_params,
         optimizers=optimizers,
         meta_data=meta_data,
-        freeze_every=0,  # Will be set later
+        freeze_every=freeze_every_from_checkpoint,  # Preserved from checkpoint or 0
     )
 
     return model_context, grad_accum_steps
@@ -378,7 +402,9 @@ def setup_dataloaders(
     )
 
 
-def setup_lr_scheduler(settings: TrainSettings, num_iterations: int) -> Callable[[int], float]:
+def setup_lr_scheduler(
+    settings: TrainSettings, num_iterations: int
+) -> Callable[[int], float]:
     """Create LR multiplier function."""
     return lr_multiplier_factory(
         warmup_ratio=settings.warmup_ratio,
@@ -388,7 +414,9 @@ def setup_lr_scheduler(settings: TrainSettings, num_iterations: int) -> Callable
     )
 
 
-def init_loop_state(meta_data: dict[str, Any] | None, resume_from_step: int) -> TrainingLoopState:
+def init_loop_state(
+    meta_data: dict[str, Any] | None, resume_from_step: int
+) -> TrainingLoopState:
     """Initialize or restore loop state variables.
 
     Returns:
@@ -423,7 +451,10 @@ def train_loop(
 
     def build_val_loader():
         return tokenizing_distributed_data_loader(
-            eval_batch_size, settings.max_seq_len, split="val", device=compute_state.device
+            eval_batch_size,
+            settings.max_seq_len,
+            split="val",
+            device=compute_state.device,
         )
 
     step = loop_state.step
@@ -437,7 +468,9 @@ def train_loop(
 
     # Initialize gradient and weight monitors
     gradient_monitor = GradientMonitor(model_context.orig_model)
-    weight_monitor = WeightMonitor(model_context.orig_model, log_frequency=settings.log_weights_every)
+    weight_monitor = WeightMonitor(
+        model_context.orig_model, log_frequency=settings.log_weights_every
+    )
 
     pbar = tqdm(range(num_iterations), desc="training")
     for mstep in pbar:  # pyrefly: ignore
@@ -449,11 +482,23 @@ def train_loop(
                 model_context.model.eval()
                 val_loader = build_val_loader()
                 eval_steps = settings.eval_tokens // (
-                    eval_batch_size * settings.max_seq_len * compute_state.ddp_world_size
+                    eval_batch_size
+                    * settings.max_seq_len
+                    * compute_state.ddp_world_size
                 )
                 with autocast_ctx:
-                    val_bpb = evaluate_bpb(model_context.model, val_loader, eval_steps, tokenizer_state.token_bytes, step)
-                print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+                    val_result = evaluate_bpb(
+                        model_context.model,
+                        val_loader,
+                        eval_steps,
+                        tokenizer_state.token_bytes,
+                        step,
+                    )
+                val_bpb = val_result["bpb"]
+                val_perplexity = val_result["perplexity"]
+                print0(
+                    f"Step {step:05d} | Validation bpb: {val_bpb:.4f}, perplexity: {val_perplexity:.4f}"
+                )
             model_context.model.train()
 
             if val_bpb < min_val_bpb:
@@ -463,6 +508,7 @@ def train_loop(
                     "step": step,
                     "total_training_time": total_training_time,
                     "val/bpb": val_bpb,
+                    "val/perplexity": val_perplexity,
                 }
             )
 
@@ -541,6 +587,8 @@ def train_loop(
                     "max_seq_len": settings.max_seq_len,
                     "dataloader_state_dict": data_context.dataloader_state_dict,
                     "loop_state": checkpoint_loop_state.to_dict(),
+                    "freeze_every": model_context.freeze_every,
+                    "prev_gate_level": model_context.orig_model.prev_gate_level,
                 },
                 rank=compute_state.ddp_rank,
             )
@@ -554,13 +602,17 @@ def train_loop(
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
                 if settings.build_by_layer:
-                    loss = model_context.model(data_context.x, data_context.y, step=step)
+                    loss = model_context.model(
+                        data_context.x, data_context.y, step=step
+                    )
                 else:
                     loss = model_context.model(data_context.x, data_context.y)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
-            data_context.x, data_context.y, data_context.dataloader_state_dict = next(data_context.train_loader)
+            data_context.x, data_context.y, data_context.dataloader_state_dict = next(
+                data_context.train_loader
+            )
 
         # Collect per-layer gradients after backward pass
         layer_grad_data = {}
@@ -732,8 +784,12 @@ def main(settings: TrainSettings) -> None:
     # Print parameter breakdown
     n_params = sum(p.numel() for p in model_context.model.transformer.h.parameters())
     print0(f"N params in transformer: {n_params:,}")
-    print0(f"N params in lm head: {sum(p.numel() for p in model_context.model.lm_head.parameters()):,}")
-    print0(f"N params in embedding: {sum(p.numel() for p in model_context.model.transformer.wte.parameters()):,}")
+    print0(
+        f"N params in lm head: {sum(p.numel() for p in model_context.model.lm_head.parameters()):,}"
+    )
+    print0(
+        f"N params in embedding: {sum(p.numel() for p in model_context.model.transformer.wte.parameters()):,}"
+    )
     print0(f"N params: {model_context.num_params:,}")
 
     # Compute training iterations
@@ -751,7 +807,10 @@ def main(settings: TrainSettings) -> None:
 
     # Setup dataloaders
     data_context = setup_dataloaders(
-        compute_state.device, model_context.meta_data, device_batch_size, settings.max_seq_len
+        compute_state.device,
+        model_context.meta_data,
+        device_batch_size,
+        settings.max_seq_len,
     )
 
     # Setup LR scheduler

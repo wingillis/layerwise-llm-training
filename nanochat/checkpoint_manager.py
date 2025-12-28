@@ -1,6 +1,7 @@
 """
 Utilities for saving and loading model/optim/state checkpoints.
 """
+
 import os
 import re
 import json
@@ -16,11 +17,16 @@ from nanochat.common import setup_default_logging
 # Set up logging
 setup_default_logging()
 logger = logging.getLogger(__name__)
+
+
 def log0(message):
-    if int(os.environ.get('RANK', 0)) == 0:
+    if int(os.environ.get("RANK", 0)) == 0:
         logger.info(message)
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+
+def save_checkpoint(
+    checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0
+):
     if rank == 0:
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         # Save the model state parameters
@@ -36,6 +42,7 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         optimizer_path = Path(checkpoint_dir) / f"optim_{step:06d}_rank{rank:d}.pt"
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
@@ -55,13 +62,16 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
 def build_model(checkpoint_dir, step, device, phase):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
+    Auto-detects GPT vs WeightApproxGPT from checkpoint metadata.
     Returns:
     - base model - uncompiled, not wrapped in DDP
     - tokenizer
     - meta data saved during base model training
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
+    model_data, optimizer_data, meta_data = load_checkpoint(
+        checkpoint_dir, step, device, load_optimizer=False
+    )
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
         model_data = {
@@ -72,13 +82,34 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
+
+    # Detect model type from config: WeightApproxGPT has 'approx_type' field
+    is_weight_approx = "approx_type" in model_config_kwargs
+
+    if is_weight_approx:
+        # Import here to avoid circular dependency
+        from nanochat.approximated_gpt import WeightApproxGPT, WeightApproxGPTConfig
+
+        model_config = WeightApproxGPTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = WeightApproxGPT(model_config, freeze_every=None)
+    else:
+        model_config = GPTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = GPT(model_config)
+
     # Load the model state
     model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    model.init_weights()  # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
     model.load_state_dict(model_data, strict=True, assign=True)
+
+    # Restore layer-wise training state for WeightApproxGPT
+    if is_weight_approx:
+        if "freeze_every" in meta_data:
+            model.freeze_every = meta_data["freeze_every"]
+        if "prev_gate_level" in meta_data:
+            model.prev_gate_level = meta_data["prev_gate_level"]
+
     # Put the model in the right training phase / mode
     if phase == "eval":
         model.eval()
@@ -111,7 +142,9 @@ def _resolve_checkpoint_path(checkpoints_dir, model_tag=None, step=None):
             model_tag = candidates[0][1]
         else:
             # if that failed, take the most recently updated model:
-            model_tags.sort(key=lambda x: (checkpoints_path / x).stat().st_mtime, reverse=True)
+            model_tags.sort(
+                key=lambda x: (checkpoints_path / x).stat().st_mtime, reverse=True
+            )
             model_tag = model_tags[0]
         log0(f"No model tag provided, guessing model tag: {model_tag}")
 
@@ -126,8 +159,10 @@ def _resolve_checkpoint_path(checkpoints_dir, model_tag=None, step=None):
 
     return str(checkpoint_dir), step
 
+
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
+
 
 def load_model(source, device, phase, model_tag=None, step=None):
     """Load a model from checkpoints directory.
@@ -147,7 +182,9 @@ def load_model(source, device, phase, model_tag=None, step=None):
     base_dir = get_base_dir()
     checkpoints_dir = base_dir / "base_checkpoints"
 
-    checkpoint_dir, step = _resolve_checkpoint_path(str(checkpoints_dir), model_tag, step)
+    checkpoint_dir, step = _resolve_checkpoint_path(
+        str(checkpoints_dir), model_tag, step
+    )
     log0(f"Loading model from {checkpoint_dir} with step {step}")
     model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
     return model, tokenizer, meta_data
