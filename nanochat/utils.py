@@ -1,87 +1,9 @@
-import hashlib
-import json
-from datetime import datetime
-from filelock import FileLock
-from functools import wraps
-from pathlib import Path
-
 import torch
 from nanochat.approximated_gpt import (
     WeightApproxGPT,
     ApproxWeightMLP,
 )
-from nanochat.common import print0, get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-
-
-def disk_cache(key_fn, cache_name, cache_dir=None):
-    """
-    Decorator that caches function results to disk.
-
-    Args:
-        key_fn: A function that takes (*args, **kwargs) and returns a
-                JSON-serializable dict representing the unique cache key.
-        cache_name: Name for this cache (used in directory/file naming)
-        cache_dir: Optional custom cache directory. Defaults to get_base_dir()
-
-    The decorated function will have an additional `force_recalculate` kwarg
-    that bypasses the cache when True.
-
-    Returns:
-        Decorated function that checks cache before executing.
-    """
-
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # Pop force_recalculate from kwargs (not passed to original function)
-            force_recalculate = kwargs.pop("force_recalculate", False)
-
-            # Determine cache directory
-            base = Path(cache_dir) if cache_dir else Path(get_base_dir())
-            cache_path = base / cache_name
-            cache_path.mkdir(parents=True, exist_ok=True)
-
-            # Generate cache key
-            key_dict = key_fn(*args, **kwargs)
-            key_json = json.dumps(key_dict, sort_keys=True)
-            key_hash = hashlib.sha256(key_json.encode()).hexdigest()[:16]
-            cache_file = cache_path / f"{key_hash}.json"
-            lock_file = cache_path / f"{key_hash}.lock"
-
-            # Check cache (with file locking for thread safety)
-            if not force_recalculate:
-                with FileLock(str(lock_file)):
-                    if cache_file.exists():
-                        try:
-                            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-                            print0(
-                                f"[disk_cache] Cache hit for {func.__name__} (key={key_hash})"
-                            )
-                            return cached["result"]
-                        except (json.JSONDecodeError, KeyError):
-                            # Corrupted cache file, will recalculate
-                            pass
-
-            # Cache miss or force_recalculate - run the function
-            result = func(*args, **kwargs)
-
-            # Save to cache (with file locking)
-            with FileLock(str(lock_file)):
-                cache_entry = {
-                    "key": key_dict,
-                    "result": result,
-                    "timestamp": datetime.now().isoformat(),
-                }
-                cache_file.write_text(
-                    json.dumps(cache_entry, indent=2), encoding="utf-8"
-                )
-
-            return result
-
-        return wrapper
-
-    return decorator
 
 
 def lr_multiplier_factory(warmup_ratio, warmdown_ratio, num_iterations, final_lr_frac):
